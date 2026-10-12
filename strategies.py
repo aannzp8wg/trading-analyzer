@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from constants import AUTO, BREAKOUT, CONTRARIAN, MEAN_REV, PULLBACK, TREND
+from constants import AUTO, BREAKOUT, CONTRARIAN, MEAN_REV, PULLBACK, TREND, WYCKOFF
 from data_engine import apply_bias_filter
 from gold_engine import (CONFLUENCE, NEW_STRATEGIES, RSI2, SQUEEZE,
                           TURTLE, extra_signals)
@@ -125,7 +125,10 @@ def strategy_signals(df):
     return sigs_
 
 
-def auto_signals(df, sigs, bias=None):
+def auto_signals_ex(df, sigs, bias=None):
+    """يرجع (إشارات AUTO، قناع mean_rev) — القناع True حيث جاءت الإشارة من استراتيجية انعكاسية.
+    كان الباكتست يمرّر mean_rev=False لـ AUTO فتُقيَّم صفقات الارتداد بأهداف الاتجاه، بينما
+    المسار الحي يستخدم هدف المتوسط (SMA20) لها: تضارب بين الباكتست والواقع."""
     adx = pd.to_numeric(df["ADX14"], errors="coerce")
     orders = {
         "trend": [CONFLUENCE, TREND, BREAKOUT, SQUEEZE, TURTLE, PULLBACK],
@@ -143,15 +146,39 @@ def auto_signals(df, sigs, bias=None):
 
     def choose(order):
         chosen = pd.Series(0, index=df.index, dtype=int)
+        mr = pd.Series(False, index=df.index)
         for name in order:
-            s = pd.to_numeric(local.get(name, pd.Series(0, index=df.index)),
-                              errors="coerce").fillna(0).astype(int)
-            chosen = chosen.where(chosen != 0, s)
-        return chosen
+            s_ = pd.to_numeric(local.get(name, pd.Series(0, index=df.index)),
+                               errors="coerce").fillna(0).astype(int)
+            take = (chosen == 0) & (s_ != 0)
+            chosen = chosen.where(~take, s_)
+            mr = mr.where(~take, name in CONTRARIAN)
+        return chosen, mr
 
-    trend = choose(orders["trend"])
-    rng = choose(orders["range"])
-    transition = choose(orders["transition"])
-    out = trend.where(adx >= 25, transition)
-    out = out.where(adx >= 20, rng)
-    return out.fillna(0).astype(int)
+    (trend, mr_t), (rng, mr_r), (transition, mr_x) = (choose(orders[k]) for k in ("trend", "range", "transition"))
+    out = trend.where(adx >= 25, transition).where(adx >= 20, rng)
+    mr_out = mr_t.where(adx >= 25, mr_x).where(adx >= 20, mr_r)
+    return out.fillna(0).astype(int), mr_out.fillna(False).astype(bool)
+
+
+def auto_signals(df, sigs, bias=None):
+    return auto_signals_ex(df, sigs, bias)[0]
+
+
+ALL_STRATEGIES = [AUTO, CONFLUENCE, TREND, BREAKOUT, SQUEEZE, TURTLE, PULLBACK, RSI2, MEAN_REV, WYCKOFF]
+
+
+def all_strategy_signals(df, bias=None):
+    """مصدر واحد لإشارات الباكتست والـ Walk-Forward: يرجع (sigs, mr)
+    sigs[name] = إشارات (مفلترة باتجاه اليومي للاتجاهية)، mr[name] = bool أو مصفوفة bool (لـ AUTO)."""
+    raw = {k: v.copy() for k, v in strategy_signals(df).items()}
+    auto, auto_mr = auto_signals_ex(df, raw, bias)
+    out = dict(raw)
+    if bias is not None:
+        trend_part = {k: v for k, v in raw.items() if k not in CONTRARIAN}
+        contra_part = {k: v for k, v in raw.items() if k in CONTRARIAN}
+        out.update({**apply_bias_filter(trend_part, bias), **contra_part})
+    out[AUTO] = auto
+    mr = {k: (k in CONTRARIAN) for k in out}
+    mr[AUTO] = auto_mr.to_numpy()
+    return out, mr
