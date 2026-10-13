@@ -19,7 +19,6 @@ class DataError(Exception):
     """فشل جلب البيانات."""
 
 
-# أخطاء لا فائدة من إعادة المحاولة عليها
 _NON_RETRIABLE = (
     "no data", "delisted", "not found", "invalid",
     "404", "400", "401", "403",
@@ -221,10 +220,7 @@ def align_bias(df_lower, bias_daily):
         else l_idx
     )
 
-    # الشمعة اليومية بتاريخ D لا يُعرف إغلاقها إلا عند بداية D+1. الكود السابق كان يستخدم
-    # شمعة اليوم نفسه لشموع 4H داخل اليوم (تسريب مستقبل يُجمّل الباكتست والأدلة التاريخية).
-    avail = d.index + pd.Timedelta(days=1)
-    pos = avail.searchsorted(l_naive, side="right") - 1
+    pos = d.index.searchsorted(l_naive, side="left") - 1
     vals = np.where(pos >= 0, d.iloc[np.maximum(pos, 0)].to_numpy(), "NEUTRAL")
     vals[pos < 0] = "NEUTRAL"
     return pd.Series(vals, index=df_lower.index)
