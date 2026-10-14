@@ -402,7 +402,7 @@ with st.sidebar:
     balance = st.number_input("رأس المال (للحجم المقترح)",
                               min_value=100.0, value=10000.0, step=100.0)
     risk_pct = st.slider("المخاطرة لكل صفقة %", 0.25, 3.0, 1.0, 0.25)
-    alert_threshold = st.slider("حد التنبيه (نقاط الجودة)", 60, 95, 85, 5)
+    alert_threshold = st.slider("حد التنبيه (نقاط الجودة)", 60, 95, 70, 5)
     contract_size = st.number_input(
         "وحدات لكل 1 لوت", min_value=0.0001,
         value=guess_contract_size(ticker),
@@ -492,9 +492,10 @@ if analyze_btn:
 
                         evidence, score, parts = None, 0, []
                         if signal in ("BUY", "SELL"):
-                            evidence = history_evidence(
-                                t, timeframe, df, bias_s, used,
-                                use_closed, cost=cost_pct)
+                            # 🔴 معطّل مؤقتًا للسرعة على Streamlit Cloud
+                            # evidence = history_evidence(
+                            #     t, timeframe, df, bias_s, used,
+                            #     use_closed, cost=cost_pct)
                             score, parts = compute_quality(
                                 signal, df, adx, used, bias,
                                 agents["tech"], agents["news"],
@@ -623,43 +624,6 @@ if a is not None:
                      plan["sl"], plan["tp1"], plan["tp2"], a.get("tf", TF_D1)),
         use_container_width=True,
     )
-
-    ev = a.get("evidence")
-    if ev and ev.get("walk_forward"):
-        with st.expander(f"🚶 Walk-Forward — {ev.get('folds', 0)} نوافذ",
-                          expanded=True):
-            st.caption("في كل نافذة، اختار النظام استراتيجيته على بيانات تدريب "
-                       "فقط، ثم اختُبر على نافذة تالية لم يرَها.")
-            pf = pd.DataFrame(ev.get("per_fold", []))
-            if not pf.empty:
-                pf = pf.rename(columns={
-                    "fold": "نافذة", "pick": "الاستراتيجية المختارة",
-                    "train_r": "R تدريب", "train_n": "صفقات تدريب",
-                    "test_r": "R اختبار", "test_n": "صفقات اختبار",
-                    "test_total": "إجمالي اختبار %",
-                })
-                st.dataframe(pf, use_container_width=True, hide_index=True)
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("إجمالي صفقات OOS", ev.get("trades", 0))
-            m2.metric("متوسط R (OOS)", f"{ev.get('avg_r', 0):.2f}")
-            m3.metric("PF (OOS)",
-                      f"{ev.get('pf', 0):.2f}"
-                      if np.isfinite(ev.get('pf', 0)) else "∞")
-            m4.metric("إجمالي % (OOS)", f"{ev.get('total', 0):+.1f}%")
-
-            if ev.get("picks"):
-                uniq = len(set(ev["picks"]))
-                if uniq > 1:
-                    st.success(
-                        f"✅ النظام اختار {uniq} استراتيجية مختلفة عبر "
-                        f"{len(ev['picks'])} نوافذ — دليل على التكيّف."
-                    )
-                else:
-                    st.info(
-                        f"النظام اختار نفس الاستراتيجية "
-                        f"({ev['picks'][0].split(' (')[0]}) في كل النوافذ."
-                    )
 
     st.markdown("## 🧠 فريق الوكلاء")
     ag = a.get("agents")
