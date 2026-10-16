@@ -4,6 +4,7 @@ agents.py — فريق الوكلاء: استدعاء Gemini/Groq، التحقق
 بناء سياق السوق للوكلاء، وإرسال تنبيهات Telegram.
 """
 import json
+import logging
 import re
 import threading
 import time
@@ -14,9 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import streamlit as st
-from google import genai
-from google.genai import types
-from groq import Groq
 
 from constants import GEMINI_FALLBACK, GROQ_FALLBACK, TF_D1
 from risk_engine import P, as_list, clean_price_levels, trade_levels, truthy
@@ -28,6 +26,18 @@ except Exception:
     GEMINI_API_KEY = GROQ_API_KEY = ""
 
 
+# مكتبات الذكاء الاصطناعي تُحمَّل عند أول استعمال فقط (تسريع الإقلاع،
+# ولا ينهار التطبيق كله إن غابت مكتبة)
+_clients: dict = {}
+
+
+def _genai():
+    from google import genai
+    from google.genai import types
+    return genai, types
+
+
+# كاش عناوين Google News (5 دقائق)
 _news_cache: dict = {}
 _news_lock = threading.Lock()
 _NEWS_TTL_SEC = 300
@@ -63,8 +73,11 @@ def validate_tech_json(obj, signal):
     if not 0 <= conf <= 100:
         return None
     supports = truthy(obj.get("supports_signal"))
-    if signal in ("BUY", "SELL") and supports and verdict != signal:
-        return None
+    if signal in ("BUY", "SELL"):
+        if supports and verdict != signal:
+            return None
+        if not supports and verdict == signal:
+            return None   # متناقض: يقول رأيه = الإشارة ويقول إنه لا يؤيدها
     obj["confidence"] = conf
     obj["supports_signal"] = supports
     obj["verdict"] = verdict
@@ -161,12 +174,14 @@ def rank_groq_models(ids):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _list_gemini():
+    genai, _ = _genai()
     client = genai.Client(api_key=GEMINI_API_KEY)
     return [m.name.replace("models/", "") for m in client.models.list()]
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def _list_groq():
+    from groq import Groq
     client = Groq(api_key=GROQ_API_KEY)
     return [m.id for m in client.models.list().data]
 
@@ -186,22 +201,31 @@ def get_groq_models():
 
 
 def _gemini_client():
-    try:
-        return genai.Client(api_key=GEMINI_API_KEY,
-                            http_options=types.HttpOptions(timeout=30000))
-    except Exception:
-        return genai.Client(api_key=GEMINI_API_KEY)
+    if "gemini" not in _clients:
+        genai, types = _genai()
+        try:
+            _clients["gemini"] = genai.Client(
+                api_key=GEMINI_API_KEY,
+                http_options=types.HttpOptions(timeout=30000))
+        except Exception:
+            _clients["gemini"] = genai.Client(api_key=GEMINI_API_KEY)
+    return _clients["gemini"]
 
 
 def _groq_client():
-    try:
-        return Groq(api_key=GROQ_API_KEY, timeout=30.0, max_retries=1)
-    except TypeError:
-        return Groq(api_key=GROQ_API_KEY)
+    if "groq" not in _clients:
+        from groq import Groq
+        try:
+            _clients["groq"] = Groq(api_key=GROQ_API_KEY, timeout=30.0, max_retries=1)
+        except TypeError:
+            _clients["groq"] = Groq(api_key=GROQ_API_KEY)
+    return _clients["groq"]
 
 
 def call_groq(system, user, temperature=0.2, models=None, budget=45):
     models = models or GROQ_FALLBACK
+    if not GROQ_API_KEY:
+        return "", "Groq: المفتاح GROQ_API_KEY غير مضبوط.", ""
     t0, last_err = time.time(), ""
     for model_name in models:
         if time.time() - t0 > budget:
@@ -233,16 +257,21 @@ def _grounding_sources(resp):
             if w and w.uri and w.uri not in seen:
                 seen.add(w.uri)
                 out.append({"title": w.title or w.uri, "uri": w.uri})
-    except Exception:
-        pass
+    except (AttributeError, IndexError, TypeError):
+        pass  # لا توجد بيانات تأريض في هذا الرد: حالة طبيعية
+    except Exception as e:
+        logging.getLogger(__name__).warning("grounding parse failed: %r", e)
     return out[:6]
 
 
 def call_gemini(prompt, search=False, models=None, budget=45):
     models = models or GEMINI_FALLBACK
+    if not GEMINI_API_KEY:
+        return "", [], "Gemini: المفتاح GEMINI_API_KEY غير مضبوط.", ""
     t0, err = time.time(), ""
     try:
         client = _gemini_client()
+        _, types = _genai()
         cfg = (
             types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
@@ -287,6 +316,7 @@ def call_gemini(prompt, search=False, models=None, budget=45):
 
 
 def swing_levels(df, window=5, n=3):
+    """قمم/قيعان *مؤكدة* فقط — الشمعة أعلى/أدنى من window شمعة قبلها وبعدها."""
     d = df.tail(150)
     if len(d) < 2 * window + 1:
         return [], []
@@ -330,7 +360,7 @@ def build_context(t, df, tf, bias, regime, adx, used, signal, reason, checks):
     highs, lows = swing_levels(df)
     candles = df.tail(8)[["Open", "High", "Low", "Close"]].round(dec).to_string()
     candle_kind = "daily" if tf == TF_D1 else "4-hour"
-    atr_pct = pct(None if price == 0 else atr / price * 100)
+    atr_pct = pct(atr / price * 100 if abs(price) > 1e-9 else None)
     ema200_v = _safe_float(latest["EMA200"])
     from_ema200 = (
         "n/a" if (ema200_v is None or ema200_v == 0)
@@ -429,7 +459,7 @@ def fetch_news(t):
                     items.append(it)
         except Exception as e:
             errs.append(str(e)[:100])
-    return items, ("; ".join(errs) if not items else "")
+    return items, "; ".join(errs)   # تُرجَع الأخطاء الجزئية أيضًا
 
 
 NEWS_SYSTEM = (
@@ -461,6 +491,8 @@ Reply with ONE JSON object only (no markdown). Text values in Arabic:
             raw, err, model = raw2, "", model2
         else:
             err = err or err2
+    if not err and ferr:
+        err = f"تنبيه: فشل جزء من جلب الأخبار ({ferr})"
     return raw, [{"title": x["title"], "uri": x["uri"]} for x in items[:8]], err, model
 
 
@@ -490,7 +522,8 @@ Return this JSON:
 "supports_signal" is true only if you agree with the direction of the technical signal right now."""
 
     g_models, q_models = get_gemini_models(), get_groq_models()
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    ex = ThreadPoolExecutor(max_workers=2)
+    try:
         f_tech = ex.submit(call_groq, TECH_SYSTEM, tech_user, 0.2, q_models)
         f_news = ex.submit(news_agent, t, signal, g_models, q_models)
         try:
@@ -501,6 +534,9 @@ Return this JSON:
             news_raw, news_sources, news_err, news_model = f_news.result(timeout=100)
         except Exception as e:
             news_raw, news_sources, news_err, news_model = "", [], f"انتهت المهلة: {str(e)[:80]}", ""
+    finally:
+        # لا ننتظر؛ المهام التي لم تبدأ تُلغى. ما بدأ فعلًا ينتهي بمهلات HTTP (30ث)
+        ex.shutdown(wait=False, cancel_futures=True)
 
     tech = validate_tech_json(extract_json(tech_raw), signal)
     news = validate_news_json(extract_json(news_raw))
