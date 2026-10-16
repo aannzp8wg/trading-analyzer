@@ -3,18 +3,16 @@ agents.py — فريق الوكلاء: استدعاء Gemini/Groq، التحقق
 شكل ردودهم (JSON schema)، جلب الأخبار من Google News RSS،
 بناء سياق السوق للوكلاء، وإرسال تنبيهات Telegram.
 """
-import concurrent.futures as _cf
 import json
 import logging
 import re
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -47,7 +45,6 @@ _NEWS_TTL_SEC = 300
 
 
 def _scrub(text, *tokens):
-    """يحجب كل المفاتيح الحساسة من أي نص خطأ قبل عرضه للمستخدم."""
     if not text:
         return ""
     out = str(text)
@@ -141,7 +138,6 @@ def validate_risk_json(obj):
 
 
 def rank_gemini_models(names):
-    """يرتّب النماذج المتوفرة فقط. لا يضيف احتياطيًا غير موجود."""
     names = list(names or [])
     if not names:
         return list(GEMINI_FALLBACK[:3])
@@ -368,7 +364,6 @@ def call_gemini(prompt, search=False, models=None, budget=45):
 
 
 def swing_levels(df, window=5, n=3):
-    """قمم/قيعان *مؤكدة* فقط."""
     d = df.tail(150)
     if len(d) < 2 * window + 1:
         return [], []
@@ -483,7 +478,6 @@ def fetch_google_news(query, days=3, limit=8):
 
 
 def _fetch_google_news_cached(query, days, limit):
-    """LRU: عند التجاوز نحذف الأقدم وصولًا، لا المنتهي فقط."""
     key = (query, int(days), int(limit))
     now = time.time()
     with _news_lock:
@@ -601,10 +595,9 @@ Return this JSON:
                         ("", msg, "") if key == "tech"
                         else ("", [], msg, "")
                     )
-        except _cf.TimeoutError:
+        except FuturesTimeout:
             pass
     finally:
-        # إلغاء ما لم يبدأ، ثم إغلاق بلا انتظار
         for fut in futures:
             if not fut.done():
                 fut.cancel()
