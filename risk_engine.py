@@ -8,16 +8,18 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-from constants import (AUTO, BREAKOUT, CONTRARIAN, DEFAULT_COST, MEAN_REV,
+from constants import (ALL_STRATEGIES, AUTO, BREAKOUT, CONTRARIAN, DEFAULT_COST, GANN, MEAN_REV,
                         PULLBACK, SL_ATR, TF_D1, TP1_ATR, TP2_ATR, TREND)
-from data_engine import apply_bias_filter, load_prepared
+from data_engine import load_prepared
 from gold_engine import (CONFLUENCE, RSI2, SQUEEZE, TURTLE,
                           run_backtest_v2, smart_levels)
-from strategies import auto_signals, strategy_signals
+from strategies import strategy_matrix
 
 
 def P(x):
+    """تنسيق سعر آمن."""
     try:
         x = float(x)
     except (TypeError, ValueError):
@@ -73,6 +75,7 @@ def guess_contract_size(ticker):
 
 
 def trade_levels(signal, price, atr, df=None, mean_rev=False, levels=None):
+    """إذا مُرِّرت levels (خرج smart_levels محسوب مسبقًا) نعيد استخدامها."""
     if levels is not None:
         return levels["sl"], levels["tp1"], levels["tp2"]
     if df is not None:
@@ -87,6 +90,7 @@ def trade_levels(signal, price, atr, df=None, mean_rev=False, levels=None):
 
 
 def news_policy(news):
+    """سياسة أخبار واحدة مشتركة بين التحكيم وحساب نقاط الجودة."""
     if not isinstance(news, dict):
         return {"status": "missing", "impact": "unknown",
                 "event_risk": "unknown", "mult": 0.5}
@@ -185,8 +189,7 @@ def build_plan(signal, price, atr, arb, balance, risk_pct,
     return plan
 
 
-_ALL_STRATEGIES = [AUTO, CONFLUENCE, TREND, BREAKOUT, SQUEEZE,
-                   TURTLE, PULLBACK, RSI2, MEAN_REV]
+_ALL_STRATEGIES = ALL_STRATEGIES
 
 
 def _slice(tr, d0, d1):
@@ -196,21 +199,10 @@ def _slice(tr, d0, d1):
     return tr[(dates >= d0) & (dates < d1)].copy()
 
 
-def _strategy_matrix(dfh, bias_h):
-    sigs = strategy_signals(dfh)
-    raw = {k: v.copy() for k, v in sigs.items()}
-    sigs[AUTO] = auto_signals(dfh, raw, bias_h)
-    if bias_h is not None:
-        tp = {k: v for k, v in raw.items() if k not in CONTRARIAN}
-        cp = {k: v for k, v in raw.items() if k in CONTRARIAN}
-        tp = apply_bias_filter(tp, bias_h)
-        sigs.update({**tp, **cp})
-    return sigs
-
-
 def walk_forward_evidence(t, tf, df, bias_s, used_fallback, cost=None, hold=30,
                           n_folds=5, train_frac=0.15, test_frac=0.15,
                           embargo=5, min_train_trades=8):
+    """Walk-forward حقيقي باختيار استراتيجية متجدد."""
     cost = DEFAULT_COST.get(t.strip().upper(), 0.1) if cost is None else cost
     try:
         if tf == TF_D1:
@@ -224,7 +216,7 @@ def walk_forward_evidence(t, tf, df, bias_s, used_fallback, cost=None, hold=30,
         if dfh is None or len(dfh) < 400:
             return None
 
-        sigs = _strategy_matrix(dfh, bias_h)
+        sigs = strategy_matrix(dfh, bias_h)
         all_tr = {}
         for name in _ALL_STRATEGIES:
             sig = sigs.get(name)
@@ -244,9 +236,10 @@ def walk_forward_evidence(t, tf, df, bias_s, used_fallback, cost=None, hold=30,
         start = 200
         n = len(dfh)
         usable = n - start
-        window = usable // (n_folds + 1)
+        window = (usable - embargo) // (n_folds + 1)
         if window < 30:
             return None
+        last_ts = pd.Timestamp(dfh.index[-1])
 
         picks, per_fold, test_chunks = [], [], []
         for k in range(n_folds):
@@ -260,7 +253,8 @@ def walk_forward_evidence(t, tf, df, bias_s, used_fallback, cost=None, hold=30,
             d0_tr = pd.Timestamp(dfh.index[tr_s])
             d1_tr = pd.Timestamp(dfh.index[tr_e])
             d0_te = pd.Timestamp(dfh.index[te_s])
-            d1_te = pd.Timestamp(dfh.index[te_e])
+            d1_te = (pd.Timestamp(dfh.index[te_e]) if te_e < n
+                     else last_ts + pd.Timedelta(days=1))
 
             best_name, best_score, best_tr_st = None, -np.inf, None
             for name, tr in all_tr.items():
@@ -322,6 +316,7 @@ def walk_forward_evidence(t, tf, df, bias_s, used_fallback, cost=None, hold=30,
 
 def _single_split_evidence(t, tf, df, bias_s, used, use_closed, cost=None,
                            hold=30, n_folds=3, oos_frac=0.30):
+    """نسخة احتياطية (تقسيم واحد) — تُستخدم إن فشل walk-forward."""
     cost = DEFAULT_COST.get(t.strip().upper(), 0.1) if cost is None else cost
     try:
         if tf == TF_D1:
@@ -334,15 +329,7 @@ def _single_split_evidence(t, tf, df, bias_s, used, use_closed, cost=None,
         if dfh is None or len(dfh) < 300:
             return None
 
-        sigs = strategy_signals(dfh)
-        if used == AUTO:
-            sig = auto_signals(dfh, sigs, bias_h)
-        else:
-            if bias_h is not None and used not in CONTRARIAN:
-                sigs_f = apply_bias_filter({used: sigs[used]}, bias_h)
-                sig = sigs_f.get(used)
-            else:
-                sig = sigs.get(used)
+        sig = strategy_matrix(dfh, bias_h).get(used)
         if sig is None:
             return None
 
@@ -385,14 +372,30 @@ def _single_split_evidence(t, tf, df, bias_s, used, use_closed, cost=None,
         return None
 
 
-def history_evidence(t, tf, df, bias_s, used, use_closed, cost=None, hold=30):
-    wf = walk_forward_evidence(t, tf, df, bias_s, used, cost, hold)
+@st.cache_data(ttl=900, max_entries=8, show_spinner=False)
+def _history_cached(t, tf, used, use_closed, cost, hold, last_ts, _df, _bias_s):
+    # last_ts جزء من مفتاح الكاش: شمعة جديدة = إعادة حساب
+    wf = walk_forward_evidence(t, tf, _df, _bias_s, used, cost, hold)
     if wf is not None:
         return wf
-    return _single_split_evidence(t, tf, df, bias_s, used, use_closed, cost, hold)
+    return _single_split_evidence(t, tf, _df, _bias_s, used, use_closed, cost, hold)
+
+
+def history_evidence(t, tf, df, bias_s, used, use_closed, cost=None, hold=30):
+    """نقطة دخول موحدة: Walk-Forward أولًا، ثم التقسيم الواحد (مع كاش 15 دقيقة)."""
+    fp = f"{df.index[-1]}|{len(df)}|{float(df['Close'].iloc[-1]):.6f}"
+    if bias_s is not None:
+        fp += "|" + str(int(pd.util.hash_pandas_object(
+            bias_s.tail(300), index=False).sum()))
+    return _history_cached(t, tf, used, bool(use_closed), cost, hold,
+                           fp, df, bias_s)
 
 
 def compute_quality(signal, df, adx, used, bias, tech, news, risk, ev):
+    """نقاط توافق إرشادية (0-100).
+    التوزيع: تقني 12 / ADX 10 / اتجاه يومي 13 / فني 15 / أخبار 10
+              / مخاطر 15 / OOS 25 = 100
+    """
     parts = []
     latest = df.iloc[-1]
     close, e50, e200 = float(latest["Close"]), float(latest["EMA50"]), float(latest["EMA200"])
@@ -419,7 +422,7 @@ def compute_quality(signal, df, adx, used, bias, tech, news, risk, ev):
         parts.append(("توافق الاتجاه (EMA)", pts, 12,
                       "السعر وEMA50 في اتجاه الصفقة" if pts == 12 else "الصفقة ضد الاتجاه العام جزئيًا"))
 
-    if used in (BREAKOUT, PULLBACK, TREND, SQUEEZE, TURTLE, CONFLUENCE):
+    if used in (BREAKOUT, PULLBACK, TREND, SQUEEZE, TURTLE, GANN, CONFLUENCE):
         pts = 10 if adx >= 25 else 5 if adx >= 20 else 0
     else:
         pts = 10 if adx < 20 else 5 if adx < 25 else 0
@@ -520,7 +523,7 @@ def backtest_stats(tr):
         "trades": len(tr),
         "win_rate": (tr["pnl"] > 0).mean() * 100,
         "total": tr["pnl"].sum(),
-        "avg_r": float(np.nan_to_num(tr["r"].mean(), nan=0.0)),
+        "avg_r": tr["r"].mean(),
         "pf": gross_win / gross_loss if gross_loss > 0 else float("inf"),
         "max_dd": abs(float((cum - cum.cummax()).min())),
         "avg_bars": tr["bars"].mean(),
@@ -535,6 +538,7 @@ _DOLLAR_TRIPLE = {
 
 
 def correlation_exposure_check(ticker, trades, current_position, hours=48):
+    """حارس الارتباط: يحذّر من مضاعفة الرهان على الدولار."""
     t = ticker.strip().upper()
     partners = _DOLLAR_TRIPLE.get(t, set())
     if not partners:
