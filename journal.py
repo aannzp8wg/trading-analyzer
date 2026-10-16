@@ -18,11 +18,10 @@ import yfinance as yf
 from constants import SL_ATR, TP2_ATR
 from risk_engine import P
 
-ASSUMED_RISK_PCT = 1.0   # مخاطرة افتراضية للسجلات التي لا تحمل account_pnl_percent
+ASSUMED_RISK_PCT = 1.0
 
 
 def _f(v, default=0.0):
-    """float آمن: None/نص غير صالح -> default (0 قيمة صالحة ولا تُستبدل)."""
     if v is None:
         return default
     try:
@@ -33,10 +32,6 @@ def _f(v, default=0.0):
 
 
 def account_pnl_of(tr):
-    """أثر الصفقة على رأس المال بمقياس واحد دائمًا (% من الحساب).
-    - account_pnl_percent إن وُجد؛
-    - وإلا R × مخاطرة افتراضية (1%)؛
-    - وإلا None (تُتجاهل) — لا نخلط أبدًا حركة السعر الخام بأثر الحساب."""
     v = tr.get("account_pnl_percent")
     if v is not None:
         try:
@@ -111,8 +106,6 @@ def _scrub(msg, cfg):
 
 
 def _migrate_position(pos):
-    """سجلات قديمة: entry_time محلي بلا منطقة زمنية. نثبّت مرة واحدة قيمة UTC
-    (بتوقيت جهاز التشغيل الحالي) كي لا تتغير لاحقًا، ونُكمل الحقول الناقصة."""
     if not isinstance(pos, dict):
         return None
     if not pos.get("entry_ts_utc") and pos.get("entry_time"):
@@ -170,10 +163,7 @@ def journal_save(trades, position):
             etag = st.session_state.get("journal_etag")
             _, new_etag = _gist_req(
                 f"https://api.github.com/gists/{cfg[1]}",
-                cfg[0],
-                body,
-                "PATCH",
-                etag=etag,
+                cfg[0], body, "PATCH", etag=etag,
             )
             st.session_state["journal_etag"] = new_etag
         else:
@@ -181,13 +171,13 @@ def journal_save(trades, position):
                 fh.write(_jdump(obj))
         return ""
     except JournalConflict as e:
-        return f"⚠️ {e} صفقاتك محفوظة في الجلسة الحالية فقط — أعد فتح الصفحة لتزامنها."
+        return (f"⚠️ {e} صفقاتك محفوظة في الجلسة الحالية فقط — "
+                f"أعد فتح الصفحة لتزامنها.")
     except Exception as e:
         return _scrub(f"{type(e).__name__}: {e}", cfg)
 
 
 def persist(force=False, min_interval=3.0):
-    """حفظ مع debounce خفيف."""
     if not st.session_state.get("journal_ok", True):
         st.session_state["journal_save_err"] = "الحفظ متوقف لأن تحميل السجل فشل."
         return
@@ -199,7 +189,8 @@ def persist(force=False, min_interval=3.0):
         st.session_state["journal_dirty"] = True
         return
 
-    err = journal_save(st.session_state.trades, st.session_state.current_position)
+    err = journal_save(st.session_state.trades,
+                       st.session_state.current_position)
     st.session_state["journal_save_err"] = err
     st.session_state["journal_last_save_ts"] = now
     st.session_state["journal_dirty"] = bool(err)
@@ -250,7 +241,6 @@ def journal_groups(tdf):
 
 
 def get_live_price(ticker, fallback, max_age_minutes=3):
-    """يرجع (price, is_live). is_live فقط إذا كان الطابع الزمني حديثًا."""
     try:
         h = yf.Ticker(ticker).history(period="1d", interval="1m")
         if not h.empty:
@@ -305,7 +295,7 @@ def meta_from(a, source):
 
 
 def _validate_levels(direction, price, sl, tp1, tp):
-    """يرجع نص الخطأ أو "" إذا كانت المستويات سليمة ومرتبة حسب الاتجاه."""
+    """يرجع نص الخطأ أو "" إذا كانت المستويات سليمة ومرتبة."""
     vals = [price, sl, tp1, tp]
     if not all(isinstance(v, (int, float, np.floating, np.integer))
                and np.isfinite(v) for v in vals):
@@ -321,7 +311,6 @@ def _validate_levels(direction, price, sl, tp1, tp):
 
 def open_position(direction, price, ticker, atr, meta=None, sl=None, tp=None,
                   tp1=None, account_risk_pct=None, partial=0.5):
-    """يفتح الصفقة ويرجع True، أو يرفضها (False) مع إشعار خطأ."""
     sign = 1 if direction == "BUY" else -1
     price = _f(price, float("nan"))
     atr = _f(atr, float("nan"))
@@ -358,8 +347,6 @@ def open_position(direction, price, ticker, atr, meta=None, sl=None, tp=None,
 
 
 def compute_trade_result(pos, price):
-    """نتيجة إغلاق صفقة. يستعمل original_sl (بعد TP1 يصير sl = الدخول فتنهار R)،
-    ويضيف الجزء المحقق عند TP1 إن كانت الصفقة في المرحلة 1."""
     pnl = calc_pnl(pos, price)
     if int(pos.get("stage") or 0) == 1:
         partial = _f(pos.get("partial"), 0.5)
@@ -445,16 +432,15 @@ def _to_utc_index(idx):
 
 
 def _since_ts(pos):
-    """أول لحظة يُعتدّ بعدها بالشموع: آخر شمعة تمت معالجتها، وإلا لحظة الدخول (UTC)."""
     for key in ("last_bar_ts", "entry_ts_utc"):
         v = pos.get(key)
         if v:
             try:
                 ts = pd.Timestamp(v)
-                return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+                return (ts.tz_localize("UTC") if ts.tz is None
+                        else ts.tz_convert("UTC"))
             except Exception:
                 pass
-    # سجلات قديمة: entry_time محلي (توقيت الجهاز)
     try:
         return pd.Timestamp(datetime.strptime(
             pos["entry_time"], "%Y-%m-%d %H:%M").astimezone(timezone.utc))
@@ -463,10 +449,7 @@ def _since_ts(pos):
 
 
 def check_exit_candles(pos, df_bars):
-    """يفحص الشموع *المكتملة والجديدة فقط* منذ آخر فحص، ويطابق منطق run_backtest_v2.
-    يرجع (events, last_ts): last_ts آخر شمعة عولجت (UTC) لتُحفظ في الصفقة.
-    (النسخة السابقة كانت تعيد المسح من لحظة الدخول بمرحلة 'stage' مبدئية، فيُغلق
-    الوقف عند التعادل زورًا بسبب شمعة سبقت تحقق الهدف الأول.)"""
+    """يفحص الشموع *المكتملة والجديدة فقط* منذ آخر فحص."""
     events, last_ts = [], None
     if df_bars is None or df_bars.empty or pos is None:
         return events, last_ts
@@ -492,7 +475,7 @@ def check_exit_candles(pos, df_bars):
     for k, ts in enumerate(idx):
         if since is not None and ts <= since:
             continue
-        if ts + bar_td > now:      # شمعة لم تكتمل بعد
+        if ts + bar_td > now:
             break
         last_ts = ts
         hi, lo, op = hi_a[k], lo_a[k], op_a[k]
@@ -516,8 +499,10 @@ def check_exit_candles(pos, df_bars):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_bars_since(ticker, entry_time):
-    """يجلب شموع منذ وقت الدخول. 5m/1h/1d حسب العمر."""
+def fetch_bars_since(ticker, entry_time, last_bar_ts=None):
+    """يجلب شموع منذ وقت الدخول. 5m/1h/1d حسب العمر.
+    last_bar_ts يدخل في مفتاح الكاش لمنع إعادة استخدام بيانات قديمة
+    عند فتح صفقة جديدة بنفس الرمز في نفس الدقيقة."""
     try:
         entry_ts = pd.Timestamp(entry_time)
     except Exception:
@@ -527,7 +512,7 @@ def fetch_bars_since(ticker, entry_time):
         interval, kw = "5m", {"period": "5d"}
     elif age_days <= 30:
         interval, kw = "1h", {"period": "30d"}
-    else:   # أقدم من 30 يومًا: يومي من تاريخ الدخول مهما كان العمر
+    else:
         interval = "1d"
         kw = {"start": (entry_ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")}
     try:
@@ -575,16 +560,17 @@ def _apply_exit_events(events, last_ts=None):
                 realized_partial=realized,
             )
             return
-    persist(force=True)   # كان TP1 يُنقل في الذاكرة فقط ويضيع عند إعادة التحميل
+    persist(force=True)
 
 
 def check_exit(price):
-    """فحص الخروج بناءً على الشموع الجديدة منذ آخر فحص. fallback: نقطة السعر."""
+    """فحص الخروج بناءً على الشموع الجديدة منذ آخر فحص."""
     pos = st.session_state.current_position
     if pos is None:
         return
 
-    df_bars = fetch_bars_since(pos["ticker"], pos["entry_time"])
+    df_bars = fetch_bars_since(
+        pos["ticker"], pos["entry_time"], pos.get("last_bar_ts"))
     if df_bars is not None and not df_bars.empty:
         events, last_ts = check_exit_candles(pos, df_bars)
         if events:
@@ -604,7 +590,6 @@ def check_exit(price):
 
 
 def should_alert_event(news, ticker, last_alerts, cooldown_hours=6.0):
-    """تنبيه حدث اقتصادي كبير."""
     if not isinstance(news, dict):
         return False
     if str(news.get("event_risk", "")).lower() != "high":
@@ -622,7 +607,6 @@ def should_alert_event(news, ticker, last_alerts, cooldown_hours=6.0):
 
 
 def should_alert_position(pos, price, last_alert_time=None, cooldown_hours=6.0):
-    """تنبيه قرب الوقف/الهدف."""
     atr = float(pos.get("atr") or 0)
     if atr <= 0:
         return False, ""
@@ -654,7 +638,6 @@ def should_alert_position(pos, price, last_alert_time=None, cooldown_hours=6.0):
 
 
 def compute_equity_curve(trades, initial=100.0):
-    """يبني منحنى رأس المال من سجل الصفقات."""
     if not trades:
         return pd.DataFrame()
     rows = []
@@ -675,7 +658,6 @@ def compute_equity_curve(trades, initial=100.0):
 
 
 def monte_carlo(trades, n_sims=1000, n_trades=None, initial=100.0, seed=42):
-    """محاكاة مونت كارلو: إعادة سحب عشوائي للصفقات."""
     if not trades:
         return None
     pnls = []
