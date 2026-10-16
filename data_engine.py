@@ -19,6 +19,7 @@ class DataError(Exception):
     """فشل جلب البيانات."""
 
 
+# أخطاء لا فائدة من إعادة المحاولة عليها
 _NON_RETRIABLE = (
     "no data", "delisted", "not found", "invalid",
     "404", "400", "401", "403",
@@ -26,6 +27,7 @@ _NON_RETRIABLE = (
 
 
 def _fetch_yf(ticker, period, interval):
+    """جلب Yahoo مع إعادة محاولة ذكية."""
     last = ""
     for attempt in range(3):
         try:
@@ -47,9 +49,11 @@ def _fetch_yf(ticker, period, interval):
 
     if last == "empty":
         try:
-            yf.Ticker(ticker).history(
+            alt = yf.Ticker(ticker).history(
                 period=period, interval=interval, raise_errors=True,
             )
+            if alt is not None and not alt.empty:
+                return alt          # download فشل لكن history نجح: نستعمله
         except TypeError:
             pass
         except Exception as e:
@@ -206,11 +210,13 @@ def daily_bias_series(daily_df):
 
 
 def align_bias(df_lower, bias_daily):
-    """تُلصق آخر اتجاه يومي *مكتمل* قبل كل شمعة من الإطار الأقل."""
+    """تُلصق آخر اتجاه يومي *مكتمل* لكل شمعة من الإطار الأقل.
+    شمعة اليوم D (مؤرّخة D 00:00) لا تكتمل إلا عند D+1 00:00، فلا تُستعمل قبله."""
     d = pd.Series(bias_daily.values, index=pd.DatetimeIndex(bias_daily.index))
     if d.index.tz is not None:
         d.index = d.index.tz_convert("UTC").tz_localize(None)
     d = d[~d.index.duplicated(keep="last")].sort_index()
+    avail = d.index.normalize() + pd.Timedelta(days=1)
 
     l_idx = pd.DatetimeIndex(df_lower.index)
     l_naive = (
@@ -219,8 +225,8 @@ def align_bias(df_lower, bias_daily):
         else l_idx
     )
 
-    pos = d.index.searchsorted(l_naive, side="left") - 1
-    vals = np.where(pos >= 0, d.iloc[np.maximum(pos, 0)].to_numpy(), "NEUTRAL")
+    pos = avail.searchsorted(l_naive, side="right") - 1
+    vals = d.to_numpy(dtype=object)[np.maximum(pos, 0)].astype(object)
     vals[pos < 0] = "NEUTRAL"
     return pd.Series(vals, index=df_lower.index)
 
