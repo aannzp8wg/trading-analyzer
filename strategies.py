@@ -1,73 +1,55 @@
 """
 strategies.py — توليد إشارات كل استراتيجية، واختيار الاستراتيجية
 التلقائي حسب نظام السوق (ADX)، ومصفوفة الإشارات الكاملة للباكتست.
+
+مصدر الحقيقة الوحيد للإشارات هو strategy_signals (متجهي وسريع)،
+وgenerate_signal يقرأ آخر قيمة منه فقط، فيتطابق التنبيه الحي مع الباكتست.
 """
 import numpy as np
 import pandas as pd
-import streamlit as st
 
-from constants import AUTO, BREAKOUT, CONTRARIAN, MEAN_REV, PULLBACK, TREND
+from constants import (AUTO, BREAKOUT, CONFLUENCE, CONTRARIAN, GANN, MEAN_REV,
+                       PULLBACK, RSI2, SQUEEZE, TREND, TURTLE)
 from data_engine import apply_bias_filter
-from gold_engine import (CONFLUENCE, NEW_STRATEGIES, RSI2, SQUEEZE,
-                          TURTLE, extra_signals)
+from gold_engine import extra_signals
+
+_REASONS = {
+    BREAKOUT: ("اختراق صعودي فوق قمة 20 يوم + اتجاه صاعد",
+               "كسر هبوطي تحت قاع 20 يوم + اتجاه هابط",
+               "لا يوجد اختراق واضح حاليا"),
+    PULLBACK: ("ارتداد من EMA50 في اتجاه صاعد",
+               "ارتداد من EMA50 في اتجاه هابط",
+               "لا يوجد ارتداد واضح"),
+    MEAN_REV: ("تشبع بيعي: السعر تحت بولنجر السفلي + RSI < 35",
+               "تشبع شرائي: السعر فوق بولنجر العلوي + RSI > 65",
+               "السعر في المنطقة الطبيعية"),
+    GANN: ("انقلاب صاعد: الإغلاق فوق متوسط القمم (Gann HiLo)",
+           "انقلاب هابط: الإغلاق تحت متوسط القيعان (Gann HiLo)",
+           "لا يوجد انقلاب اتجاه في Gann HiLo"),
+    TREND: ("اتجاه صاعد مؤكد: فوق EMA200 + EMA20>EMA50 + الميل إيجابي",
+            "اتجاه هابط مؤكد: تحت EMA200 + EMA20<EMA50 + الميل سلبي",
+            "لا يوجد اتجاه واضح (مؤشرات متضاربة)"),
+}
 
 
-def generate_signal(df, strategy):
-    latest = df.iloc[-1]
-    signal, reason = "No Signal", ""
+def generate_signal(df, strategy, sigs=None):
+    """إشارة آخر شمعة. مرّر sigs (خرج strategy_signals) لتفادي إعادة الحساب."""
+    if sigs is None:
+        sigs = strategy_signals(df)
+    series = sigs.get(strategy)
+    v = int(series.iloc[-1]) if series is not None and len(series) else 0
+    nm = strategy.split(" (")[0]
 
-    if strategy in NEW_STRATEGIES:
-        v = int(strategy_signals(df)[strategy].iloc[-1])
-        nm = strategy.split(" (")[0]
-        if v == 1:
-            return "BUY", f"إشارة شراء من {nm}"
-        if v == -1:
-            return "SELL", f"إشارة بيع من {nm}"
-        return "No Signal", f"لا توجد إشارة من {nm}"
-
-    if strategy == BREAKOUT:
-        if latest["Close"] > df["Donchian_Upper"].iloc[-2] and latest["Close"] > latest["EMA200"]:
-            signal, reason = "BUY", "اختراق صعودي فوق قمة 20 يوم + اتجاه صاعد"
-        elif latest["Close"] < df["Donchian_Lower"].iloc[-2] and latest["Close"] < latest["EMA200"]:
-            signal, reason = "SELL", "كسر هبوطي تحت قاع 20 يوم + اتجاه هابط"
-        else:
-            reason = "لا يوجد اختراق واضح حاليا"
-
-    elif strategy == PULLBACK:
-        if latest["Close"] > latest["EMA200"] and latest["Low"] <= latest["EMA50"] and latest["Close"] > latest["Open"]:
-            signal, reason = "BUY", "ارتداد من EMA50 في اتجاه صاعد"
-        elif latest["Close"] < latest["EMA200"] and latest["High"] >= latest["EMA50"] and latest["Close"] < latest["Open"]:
-            signal, reason = "SELL", "ارتداد من EMA50 في اتجاه هابط"
-        else:
-            reason = "لا يوجد ارتداد واضح"
-
-    elif strategy == MEAN_REV:
-        if latest["Close"] < latest["BB_Lower"] and latest["RSI14"] < 35:
-            signal, reason = "BUY", "تشبع بيعي: السعر تحت بولنجر السفلي + RSI < 35"
-        elif latest["Close"] > latest["BB_Upper"] and latest["RSI14"] > 65:
-            signal, reason = "SELL", "تشبع شرائي: السعر فوق بولنجر العلوي + RSI > 65"
-        else:
-            reason = "السعر في المنطقة الطبيعية"
-
-    elif strategy == TREND:
-        try:
-            ema20_slope = float(latest["EMA20"]) - float(df["EMA20"].iloc[-2])
-        except Exception:
-            ema20_slope = 0.0
-
-        above_200 = latest["Close"] > latest["EMA200"]
-        below_200 = latest["Close"] < latest["EMA200"]
-        ema_stack_up = latest["EMA20"] > latest["EMA50"]
-        ema_stack_dn = latest["EMA20"] < latest["EMA50"]
-
-        if above_200 and ema_stack_up and ema20_slope > 0:
-            signal, reason = "BUY", "اتجاه صاعد مؤكد: فوق EMA200 + EMA20>EMA50 + الميل إيجابي"
-        elif below_200 and ema_stack_dn and ema20_slope < 0:
-            signal, reason = "SELL", "اتجاه هابط مؤكد: تحت EMA200 + EMA20<EMA50 + الميل سلبي"
-        else:
-            reason = "لا يوجد اتجاه واضح (مؤشرات متضاربة)"
-
-    return signal, reason
+    if strategy in _REASONS:
+        buy_r, sell_r, none_r = _REASONS[strategy]
+    else:
+        buy_r, sell_r, none_r = (f"إشارة شراء من {nm}", f"إشارة بيع من {nm}",
+                                 f"لا توجد إشارة من {nm}")
+    if v == 1:
+        return "BUY", buy_r
+    if v == -1:
+        return "SELL", sell_r
+    return "No Signal", none_r
 
 
 def select_strategy(df, mode, bias=None):
@@ -85,9 +67,10 @@ def select_strategy(df, mode, bias=None):
     if mode != AUTO:
         order = [mode]
 
+    sigs = strategy_signals(df)  # مرة واحدة فقط
     checks = []
     for strat in order:
-        sig, reason = generate_signal(df, strat)
+        sig, reason = generate_signal(df, strat, sigs)
         if bias is not None and sig != "No Signal" and strat not in CONTRARIAN:
             allowed = (sig == "BUY" and bias == "UP") or (sig == "SELL" and bias == "DOWN")
             if not allowed:
@@ -98,14 +81,12 @@ def select_strategy(df, mode, bias=None):
     return regime, adx, checks, chosen
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def strategy_signals(df):
+    """كل الإشارات الخام (بدون فلتر اتجاه اليومي). متجهي — لا يحتاج كاش."""
     c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
 
     def to_sig(buy, sell):
-        return pd.Series(
-            np.select([buy, sell], [1, -1], default=0),
-            index=df.index)
+        return pd.Series(np.select([buy, sell], [1, -1], default=0), index=df.index)
 
     sigs_ = {
         BREAKOUT: to_sig(
@@ -134,24 +115,35 @@ def auto_signals(df, sigs, bias=None):
     }
 
     if bias is not None:
-        trend_part = {k: v for k, v in sigs.items() if k not in CONTRARIAN}
+        trend_part = apply_bias_filter(
+            {k: v for k, v in sigs.items() if k not in CONTRARIAN}, bias)
         contra_part = {k: v for k, v in sigs.items() if k in CONTRARIAN}
-        trend_part = apply_bias_filter(trend_part, bias)
         local = {**trend_part, **contra_part}
     else:
         local = sigs
 
+    zero = pd.Series(0, index=df.index)
+
     def choose(order):
         chosen = pd.Series(0, index=df.index, dtype=int)
         for name in order:
-            s = pd.to_numeric(local.get(name, pd.Series(0, index=df.index)),
-                              errors="coerce").fillna(0).astype(int)
+            s = pd.to_numeric(local.get(name, zero), errors="coerce").fillna(0).astype(int)
             chosen = chosen.where(chosen != 0, s)
         return chosen
 
-    trend = choose(orders["trend"])
-    rng = choose(orders["range"])
-    transition = choose(orders["transition"])
-    out = trend.where(adx >= 25, transition)
-    out = out.where(adx >= 20, rng)
+    out = choose(orders["trend"]).where(adx >= 25, choose(orders["transition"]))
+    out = out.where(adx >= 20, choose(orders["range"]))
     return out.fillna(0).astype(int)
+
+
+def strategy_matrix(df, bias=None):
+    """كل الاستراتيجيات + AUTO، مع تطبيق فلتر اليومي على غير الانعكاسية.
+    نقطة واحدة تُستعمل في الباكتست وWalk-Forward والمقارنة."""
+    raw = strategy_signals(df)
+    out = dict(raw)
+    out[AUTO] = auto_signals(df, raw, bias)
+    if bias is not None:
+        filtered = apply_bias_filter(
+            {k: v for k, v in raw.items() if k not in CONTRARIAN}, bias)
+        out.update(filtered)
+    return out
