@@ -3,21 +3,26 @@ agents.py — فريق الوكلاء: استدعاء Gemini/Groq، التحقق
 شكل ردودهم (JSON schema)، جلب الأخبار من Google News RSS،
 بناء سياق السوق للوكلاء، وإرسال تنبيهات Telegram.
 """
+import concurrent.futures as _cf
 import json
 import logging
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import streamlit as st
 
 from constants import GEMINI_FALLBACK, GROQ_FALLBACK, TF_D1
 from risk_engine import P, as_list, clean_price_levels, trade_levels, truthy
+
+log = logging.getLogger(__name__)
 
 try:
     GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -26,8 +31,6 @@ except Exception:
     GEMINI_API_KEY = GROQ_API_KEY = ""
 
 
-# مكتبات الذكاء الاصطناعي تُحمَّل عند أول استعمال فقط (تسريع الإقلاع،
-# ولا ينهار التطبيق كله إن غابت مكتبة)
 _clients: dict = {}
 
 
@@ -37,10 +40,21 @@ def _genai():
     return genai, types
 
 
-# كاش عناوين Google News (5 دقائق)
-_news_cache: dict = {}
+_NEWS_CACHE_MAX = 64
+_news_cache: "OrderedDict" = OrderedDict()
 _news_lock = threading.Lock()
 _NEWS_TTL_SEC = 300
+
+
+def _scrub(text, *tokens):
+    """يحجب كل المفاتيح الحساسة من أي نص خطأ قبل عرضه للمستخدم."""
+    if not text:
+        return ""
+    out = str(text)
+    for tok in tokens:
+        if tok:
+            out = out.replace(str(tok), "***")
+    return out[:200]
 
 
 def extract_json(text):
@@ -77,7 +91,7 @@ def validate_tech_json(obj, signal):
         if supports and verdict != signal:
             return None
         if not supports and verdict == signal:
-            return None   # متناقض: يقول رأيه = الإشارة ويقول إنه لا يؤيدها
+            return None
     obj["confidence"] = conf
     obj["supports_signal"] = supports
     obj["verdict"] = verdict
@@ -127,6 +141,11 @@ def validate_risk_json(obj):
 
 
 def rank_gemini_models(names):
+    """يرتّب النماذج المتوفرة فقط. لا يضيف احتياطيًا غير موجود."""
+    names = list(names or [])
+    if not names:
+        return list(GEMINI_FALLBACK[:3])
+
     skip = (
         "image", "live", "audio", "tts", "embedding", "aqa", "vision",
         "robotics", "computer", "native", "imagen", "veo", "lite",
@@ -141,7 +160,7 @@ def rank_gemini_models(names):
         if n.startswith("gemini")
         and ("flash" in n or "pro" in n)
         and not any(x in n for x in skip)
-        and ver(n)[0] >= 3
+        and ver(n)[0] >= 2
     ]
     key = lambda n: (0 if "flash" in n else 1, -ver(n)[0], -ver(n)[1])
     stable = sorted(
@@ -149,12 +168,23 @@ def rank_gemini_models(names):
         key=key,
     )
     preview = sorted([n for n in cands if n not in stable], key=key)
-    ranked = stable + preview
-    out = ranked[:4] + [f for f in GEMINI_FALLBACK if f not in ranked[:4]]
-    return out[:5]
+    ranked = (stable + preview)[:5]
+
+    available = set(names)
+    for fb in GEMINI_FALLBACK:
+        if len(ranked) >= 4:
+            break
+        if fb in available and fb not in ranked:
+            ranked.append(fb)
+
+    return ranked or list(GEMINI_FALLBACK[:3])
 
 
 def rank_groq_models(ids):
+    ids = list(ids or [])
+    if not ids:
+        return list(GROQ_FALLBACK)
+
     skip = ("whisper", "tts", "guard", "embedding", "vision", "orpheus",
             "playai", "compound", "distil")
     chat = [i for i in ids if not any(x in i.lower() for x in skip)]
@@ -168,8 +198,15 @@ def rank_groq_models(ids):
                                 ("llama", "qwen", "kimi", "deepseek"))
     ]
     out = pri + rest
-    out += [f for f in GROQ_FALLBACK if f not in out]
-    return out[:3]
+
+    available = set(ids)
+    for fb in GROQ_FALLBACK:
+        if len(out) >= 3:
+            break
+        if fb in available and fb not in out:
+            out.append(fb)
+
+    return (out or list(GROQ_FALLBACK))[:3]
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -207,7 +244,9 @@ def _gemini_client():
             _clients["gemini"] = genai.Client(
                 api_key=GEMINI_API_KEY,
                 http_options=types.HttpOptions(timeout=30000))
-        except Exception:
+        except Exception as e:
+            log.warning(
+                "Gemini HttpOptions غير مدعومة، عميل بدون مهلة صريحة: %r", e)
             _clients["gemini"] = genai.Client(api_key=GEMINI_API_KEY)
     return _clients["gemini"]
 
@@ -216,7 +255,8 @@ def _groq_client():
     if "groq" not in _clients:
         from groq import Groq
         try:
-            _clients["groq"] = Groq(api_key=GROQ_API_KEY, timeout=30.0, max_retries=1)
+            _clients["groq"] = Groq(api_key=GROQ_API_KEY,
+                                    timeout=30.0, max_retries=1)
         except TypeError:
             _clients["groq"] = Groq(api_key=GROQ_API_KEY)
     return _clients["groq"]
@@ -231,21 +271,30 @@ def call_groq(system, user, temperature=0.2, models=None, budget=45):
         if time.time() - t0 > budget:
             last_err = last_err or "انتهت المهلة"
             break
-        try:
-            c = _groq_client().chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-            )
-            return c.choices[0].message.content or "", "", model_name
-        except Exception as e:
-            low = str(e).lower()
-            last_err = f"{model_name}: {str(e)[:140]}"
-            if "401" in low or "invalid_api_key" in low or "invalid api key" in low:
-                return "", "Groq: مفتاح API غير صالح.", ""
+        for attempt in range(2):
+            try:
+                c = _groq_client().chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    temperature=temperature,
+                )
+                return c.choices[0].message.content or "", "", model_name
+            except Exception as e:
+                low = str(e).lower()
+                last_err = _scrub(
+                    f"{model_name}: {str(e)[:140]}", GROQ_API_KEY)
+                if any(k in low for k in
+                       ("401", "invalid_api_key", "invalid api key")):
+                    return "", "Groq: مفتاح API غير صالح.", ""
+                if attempt == 0 and any(k in low for k in
+                                        ("503", "429", "rate", "overloaded",
+                                         "unavailable", "timeout")):
+                    time.sleep(2)
+                    continue
+                break
     return "", f"Groq: {last_err}", ""
 
 
@@ -258,9 +307,9 @@ def _grounding_sources(resp):
                 seen.add(w.uri)
                 out.append({"title": w.title or w.uri, "uri": w.uri})
     except (AttributeError, IndexError, TypeError):
-        pass  # لا توجد بيانات تأريض في هذا الرد: حالة طبيعية
+        pass
     except Exception as e:
-        logging.getLogger(__name__).warning("grounding parse failed: %r", e)
+        log.warning("grounding parse failed: %r", e)
     return out[:6]
 
 
@@ -296,17 +345,20 @@ def call_gemini(prompt, search=False, models=None, budget=45):
                     )
                 except Exception as e:
                     low = str(e).lower()
-                    err = f"{model_name}: {str(e)[:140]}"
+                    err = _scrub(
+                        f"{model_name}: {str(e)[:140]}", GEMINI_API_KEY)
                     if any(k in low for k in
-                           ("api key not valid", "api_key_invalid", "unauthenticated")):
+                           ("api key not valid", "api_key_invalid",
+                            "unauthenticated")):
                         return "", [], "Gemini: مفتاح API غير صالح.", ""
                     if attempt == 0 and any(k in low for k in
-                                            ("503", "unavailable", "overloaded")):
+                                            ("503", "429", "unavailable",
+                                             "overloaded", "resource_exhausted")):
                         time.sleep(2)
                         continue
                     break
     except Exception as e:
-        err = f"Gemini: {str(e)[:140]}"
+        err = _scrub(f"Gemini: {str(e)[:140]}", GEMINI_API_KEY)
     if search and any(k in err.lower() for k in
                       ("grounding", "google_search", "permission", "403")):
         err += " — قد لا يدعم حسابك بحث جوجل الحي."
@@ -316,7 +368,7 @@ def call_gemini(prompt, search=False, models=None, budget=45):
 
 
 def swing_levels(df, window=5, n=3):
-    """قمم/قيعان *مؤكدة* فقط — الشمعة أعلى/أدنى من window شمعة قبلها وبعدها."""
+    """قمم/قيعان *مؤكدة* فقط."""
     d = df.tail(150)
     if len(d) < 2 * window + 1:
         return [], []
@@ -324,8 +376,8 @@ def swing_levels(df, window=5, n=3):
     k = 2 * window + 1
     roll_max = hi.rolling(k, center=True, min_periods=k).max()
     roll_min = lo.rolling(k, center=True, min_periods=k).min()
-    highs = hi[hi == roll_max].tolist()
-    lows = lo[lo == roll_min].tolist()
+    highs = [float(x) for x in hi[hi == roll_max].tolist() if x == x]
+    lows = [float(x) for x in lo[lo == roll_min].tolist() if x == x]
     uniq = lambda xs: list(dict.fromkeys(xs))[-n:]
     return uniq(highs), uniq(lows)
 
@@ -431,20 +483,20 @@ def fetch_google_news(query, days=3, limit=8):
 
 
 def _fetch_google_news_cached(query, days, limit):
+    """LRU: عند التجاوز نحذف الأقدم وصولًا، لا المنتهي فقط."""
     key = (query, int(days), int(limit))
     now = time.time()
     with _news_lock:
         entry = _news_cache.get(key)
         if entry and (now - entry[0]) < _NEWS_TTL_SEC:
+            _news_cache.move_to_end(key)
             return entry[1]
     items = fetch_google_news(query, days, limit)
     with _news_lock:
         _news_cache[key] = (now, items)
-        if len(_news_cache) > 64:
-            stale = [k for k, (ts, _) in _news_cache.items()
-                     if now - ts >= _NEWS_TTL_SEC]
-            for k in stale:
-                _news_cache.pop(k, None)
+        _news_cache.move_to_end(key)
+        while len(_news_cache) > _NEWS_CACHE_MAX:
+            _news_cache.popitem(last=False)
     return items
 
 
@@ -458,8 +510,8 @@ def fetch_news(t):
                     seen.add(it["title"])
                     items.append(it)
         except Exception as e:
-            errs.append(str(e)[:100])
-    return items, "; ".join(errs)   # تُرجَع الأخطاء الجزئية أيضًا
+            errs.append(_scrub(str(e), GEMINI_API_KEY, GROQ_API_KEY))
+    return items, "; ".join(errs)
 
 
 NEWS_SYSTEM = (
@@ -474,7 +526,8 @@ def news_agent(t, signal, g_models, q_models):
     if not items:
         return "", [], f"لا عناوين أخبار متاحة ({ferr or 'نتيجة فارغة'})", ""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    lines = "\n".join(f"{i}. [{x['date']}] {x['title']}" for i, x in enumerate(items, 1))
+    lines = "\n".join(
+        f"{i}. [{x['date']}] {x['title']}" for i, x in enumerate(items, 1))
     prompt = f"""Today is {today}. Asset: {t}. Technical signal under review: {signal}.
 Latest headlines from Google News:
 {lines}
@@ -486,14 +539,17 @@ Reply with ONE JSON object only (no markdown). Text values in Arabic:
 "event_risk" = "high" only if the headlines show a major scheduled event within ~24h."""
     raw, _, err, model = call_gemini(prompt, False, g_models, budget=35)
     if not (raw and extract_json(raw)):
-        raw2, err2, model2 = call_groq(NEWS_SYSTEM, prompt, 0.2, q_models, budget=35)
+        raw2, err2, model2 = call_groq(
+            NEWS_SYSTEM, prompt, 0.2, q_models, budget=35)
         if raw2 and extract_json(raw2):
             raw, err, model = raw2, "", model2
         else:
             err = err or err2
     if not err and ferr:
         err = f"تنبيه: فشل جزء من جلب الأخبار ({ferr})"
-    return raw, [{"title": x["title"], "uri": x["uri"]} for x in items[:8]], err, model
+    return (raw,
+            [{"title": x["title"], "uri": x["uri"]} for x in items[:8]],
+            err, model)
 
 
 TECH_SYSTEM = (
@@ -510,7 +566,10 @@ RISK_SYSTEM = (
 
 
 def run_agents(ctx, t, signal, price, atr, df=None, mean_rev=False, levels=None):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    """
+    يشغّل الوكلاء بالتوازي مع مهلة صارمة، ولا يترك مهامًا معلّقة تستنزف
+    حصة الـ API بعد انتهاء زمن الواجهة.
+    """
     has_signal = signal in ("BUY", "SELL")
 
     tech_user = ctx + """
@@ -522,28 +581,50 @@ Return this JSON:
 "supports_signal" is true only if you agree with the direction of the technical signal right now."""
 
     g_models, q_models = get_gemini_models(), get_groq_models()
+
+    results: dict = {}
     ex = ThreadPoolExecutor(max_workers=2)
+    futures = {}
     try:
-        f_tech = ex.submit(call_groq, TECH_SYSTEM, tech_user, 0.2, q_models)
-        f_news = ex.submit(news_agent, t, signal, g_models, q_models)
+        futures = {
+            ex.submit(call_groq, TECH_SYSTEM, tech_user, 0.2, q_models): "tech",
+            ex.submit(news_agent, t, signal, g_models, q_models): "news",
+        }
         try:
-            tech_raw, tech_err, tech_model = f_tech.result(timeout=100)
-        except Exception as e:
-            tech_raw, tech_err, tech_model = "", f"انتهت المهلة: {str(e)[:80]}", ""
-        try:
-            news_raw, news_sources, news_err, news_model = f_news.result(timeout=100)
-        except Exception as e:
-            news_raw, news_sources, news_err, news_model = "", [], f"انتهت المهلة: {str(e)[:80]}", ""
+            for fut in as_completed(futures, timeout=110):
+                key = futures[fut]
+                try:
+                    results[key] = fut.result(timeout=1)
+                except Exception as e:
+                    msg = f"فشل: {_scrub(str(e), GEMINI_API_KEY, GROQ_API_KEY)[:80]}"
+                    results[key] = (
+                        ("", msg, "") if key == "tech"
+                        else ("", [], msg, "")
+                    )
+        except _cf.TimeoutError:
+            pass
     finally:
-        # لا ننتظر؛ المهام التي لم تبدأ تُلغى. ما بدأ فعلًا ينتهي بمهلات HTTP (30ث)
-        ex.shutdown(wait=False, cancel_futures=True)
+        # إلغاء ما لم يبدأ، ثم إغلاق بلا انتظار
+        for fut in futures:
+            if not fut.done():
+                fut.cancel()
+        ex.shutdown(wait=False)
+
+    results.setdefault("tech", ("", "انتهت المهلة", ""))
+    results.setdefault("news", ("", [], "انتهت المهلة", ""))
+
+    tech_raw, tech_err, tech_model = results["tech"]
+    news_raw, news_sources, news_err, news_model = results["news"]
 
     tech = validate_tech_json(extract_json(tech_raw), signal)
     news = validate_news_json(extract_json(news_raw))
-    tech_err = tech_err or ("" if tech else "تعذّر قراءة/التحقق من رد الوكيل الفني")
-    news_err = news_err or ("" if news else "تعذّر قراءة/التحقق من رد وكيل الأخبار")
+    tech_err = tech_err or (
+        "" if tech else "تعذّر قراءة/التحقق من رد الوكيل الفني")
+    news_err = news_err or (
+        "" if news else "تعذّر قراءة/التحقق من رد وكيل الأخبار")
 
-    risk, risk_raw, risk_err, risk_model, skipped = None, "", "", "", not has_signal
+    risk, risk_raw, risk_err, risk_model, skipped = (
+        None, "", "", "", not has_signal)
     if has_signal:
         if levels is not None:
             sl, tp1, tp2 = levels["sl"], levels["tp1"], levels["tp2"]
@@ -561,7 +642,8 @@ Return this JSON:
         risk_raw, risk_err, risk_model = call_groq(
             RISK_SYSTEM, risk_user, 0.2, q_models)
         risk = validate_risk_json(extract_json(risk_raw))
-        risk_err = risk_err or ("" if risk else "تعذّر قراءة/التحقق من رد مدير المخاطر")
+        risk_err = risk_err or (
+            "" if risk else "تعذّر قراءة/التحقق من رد مدير المخاطر")
 
     return {
         "tech": tech, "tech_raw": tech_raw, "tech_err": tech_err,
@@ -569,11 +651,18 @@ Return this JSON:
         "news_sources": news_sources,
         "risk": risk, "risk_raw": risk_raw, "risk_err": risk_err,
         "risk_skipped": skipped,
-        "tech_model": tech_model, "news_model": news_model, "risk_model": risk_model,
+        "tech_model": tech_model, "news_model": news_model,
+        "risk_model": risk_model,
     }
 
 
 def send_telegram(text):
+    """
+    يرسل رسالة عبر Telegram Bot API. يرجع:
+      None     — المفاتيح غير مضبوطة.
+      "ok"     — نجح الإرسال.
+      str آخر  — نص الخطأ (بدون كشف التوكن).
+    """
     try:
         token = st.secrets.get("TELEGRAM_BOT_TOKEN")
         chat = st.secrets.get("TELEGRAM_CHAT_ID")
@@ -581,12 +670,35 @@ def send_telegram(text):
         return None
     if not token or not chat:
         return None
+
+    body = (text or "").strip()
+    if not body:
+        return "لا يوجد نص لإرساله."
+    if len(body) > 4000:
+        body = body[:3990] + "…"
+
     try:
-        data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+        payload = json.dumps({
+            "chat_id": chat,
+            "text": body,
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=data
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=10) as r:
-            return "ok" if r.status == 200 else f"فشل الإرسال ({r.status})"
+            resp = json.loads(r.read() or b"{}")
+            if resp.get("ok"):
+                return "ok"
+            desc = resp.get("description") or "استجابة غير معروفة"
+            return f"فشل الإرسال: {_scrub(desc, token)}"
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read() or b"{}").get("description") or str(e)
+        except Exception:
+            detail = str(e)
+        return f"خطأ تيليجرام ({e.code}): {_scrub(detail, token)}"
     except Exception as e:
-        return f"خطأ تيليجرام: {str(e).replace(str(token), '***')[:120]}"
+        return f"خطأ تيليجرام: {_scrub(str(e), token)}"
