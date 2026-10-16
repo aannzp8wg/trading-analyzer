@@ -8,7 +8,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,44 @@ import yfinance as yf
 
 from constants import SL_ATR, TP2_ATR
 from risk_engine import P
+
+ASSUMED_RISK_PCT = 1.0   # مخاطرة افتراضية للسجلات التي لا تحمل account_pnl_percent
+
+
+def _f(v, default=0.0):
+    """float آمن: None/نص غير صالح -> default (0 قيمة صالحة ولا تُستبدل)."""
+    if v is None:
+        return default
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def account_pnl_of(tr):
+    """أثر الصفقة على رأس المال بمقياس واحد دائمًا (% من الحساب).
+    - account_pnl_percent إن وُجد؛
+    - وإلا R × مخاطرة افتراضية (1%)؛
+    - وإلا None (تُتجاهل) — لا نخلط أبدًا حركة السعر الخام بأثر الحساب."""
+    v = tr.get("account_pnl_percent")
+    if v is not None:
+        try:
+            x = float(v)
+            if np.isfinite(x):
+                return x
+        except (TypeError, ValueError):
+            pass
+    r = tr.get("r_multiple")
+    if r is not None:
+        try:
+            x = float(r)
+            if np.isfinite(x):
+                return x * ASSUMED_RISK_PCT
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 JOURNAL_FILE = os.path.join(tempfile.gettempdir(), "trading_journal.json")
 
@@ -72,6 +110,23 @@ def _scrub(msg, cfg):
     return (msg.replace(cfg[0], "***") if cfg else msg)[:160]
 
 
+def _migrate_position(pos):
+    """سجلات قديمة: entry_time محلي بلا منطقة زمنية. نثبّت مرة واحدة قيمة UTC
+    (بتوقيت جهاز التشغيل الحالي) كي لا تتغير لاحقًا، ونُكمل الحقول الناقصة."""
+    if not isinstance(pos, dict):
+        return None
+    if not pos.get("entry_ts_utc") and pos.get("entry_time"):
+        try:
+            pos["entry_ts_utc"] = datetime.strptime(
+                pos["entry_time"], "%Y-%m-%d %H:%M"
+            ).astimezone(timezone.utc).isoformat()
+        except Exception:
+            pass
+    pos.setdefault("last_bar_ts", None)
+    pos.setdefault("original_sl", pos.get("sl"))
+    return pos
+
+
 def journal_load():
     empty = {"trades": [], "position": None}
     cfg = _gist_cfg()
@@ -98,7 +153,7 @@ def journal_load():
         trades = obj.get("trades")
         return {
             "trades": trades if isinstance(trades, list) else [],
-            "position": obj.get("position"),
+            "position": _migrate_position(obj.get("position")),
         }, ""
     except Exception as e:
         return empty, _scrub(f"{type(e).__name__}: {e}", cfg)
@@ -132,6 +187,7 @@ def journal_save(trades, position):
 
 
 def persist(force=False, min_interval=3.0):
+    """حفظ مع debounce خفيف."""
     if not st.session_state.get("journal_ok", True):
         st.session_state["journal_save_err"] = "الحفظ متوقف لأن تحميل السجل فشل."
         return
@@ -194,6 +250,7 @@ def journal_groups(tdf):
 
 
 def get_live_price(ticker, fallback, max_age_minutes=3):
+    """يرجع (price, is_live). is_live فقط إذا كان الطابع الزمني حديثًا."""
     try:
         h = yf.Ticker(ticker).history(period="1d", interval="1m")
         if not h.empty:
@@ -223,12 +280,9 @@ def today_realized_account_pnl_pct(trades):
     total = 0.0
     for tr in trades or []:
         if str(tr.get("exit_time") or "").startswith(today):
-            try:
-                val = tr.get("account_pnl_percent")
-                val = val if val is not None else tr.get("pnl_percent")
-                total += float(val or 0.0)
-            except (TypeError, ValueError):
-                continue
+            val = account_pnl_of(tr)
+            if val is not None:
+                total += val
     return total
 
 
@@ -250,43 +304,74 @@ def meta_from(a, source):
     }
 
 
+def _validate_levels(direction, price, sl, tp1, tp):
+    """يرجع نص الخطأ أو "" إذا كانت المستويات سليمة ومرتبة حسب الاتجاه."""
+    vals = [price, sl, tp1, tp]
+    if not all(isinstance(v, (int, float, np.floating, np.integer))
+               and np.isfinite(v) for v in vals):
+        return "مستويات غير رقمية أو NaN"
+    if direction == "BUY":
+        ok = sl < price < tp1 <= tp
+    elif direction == "SELL":
+        ok = tp <= tp1 < price < sl
+    else:
+        return "اتجاه غير معروف"
+    return "" if ok else "الوقف/الأهداف ليست في الاتجاه الصحيح من سعر الدخول"
+
+
 def open_position(direction, price, ticker, atr, meta=None, sl=None, tp=None,
                   tp1=None, account_risk_pct=None, partial=0.5):
+    """يفتح الصفقة ويرجع True، أو يرفضها (False) مع إشعار خطأ."""
     sign = 1 if direction == "BUY" else -1
+    price = _f(price, float("nan"))
+    atr = _f(atr, float("nan"))
     original_sl = sl if sl is not None else price - sign * SL_ATR * atr
     final_tp = tp if tp is not None else price + sign * TP2_ATR * atr
     resolved_tp1 = (
         tp1 if tp1 is not None else (price + (final_tp - price) * 0.5)
     )
+    err = _validate_levels(direction, price, original_sl, resolved_tp1, final_tp)
+    if err:
+        st.session_state.notice = ("error", f"❌ لم تُفتح الصفقة: {err}.")
+        return False
 
     st.session_state.current_position = {
         "direction": direction,
-        "entry_price": price,
+        "entry_price": float(price),
         "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "entry_ts_utc": datetime.now(timezone.utc).isoformat(),
+        "last_bar_ts": None,
         "ticker": ticker,
-        "sl": original_sl,
-        "original_sl": original_sl,
-        "tp": final_tp,
-        "tp1": resolved_tp1,
+        "sl": float(original_sl),
+        "original_sl": float(original_sl),
+        "tp": float(final_tp),
+        "tp1": float(resolved_tp1),
         "partial": float(partial),
         "stage": 0,
         "realized_partial": 0.0,
-        "atr": atr,
+        "atr": float(atr),
         "account_risk_pct": account_risk_pct,
         "meta": meta or {},
     }
     persist(force=True)
+    return True
 
 
 def compute_trade_result(pos, price):
+    """نتيجة إغلاق صفقة. يستعمل original_sl (بعد TP1 يصير sl = الدخول فتنهار R)،
+    ويضيف الجزء المحقق عند TP1 إن كانت الصفقة في المرحلة 1."""
     pnl = calc_pnl(pos, price)
-    sl_dist_pct = abs(pos["entry_price"] - pos["sl"]) / pos["entry_price"] * 100
+    if int(pos.get("stage") or 0) == 1:
+        partial = _f(pos.get("partial"), 0.5)
+        pnl = _f(pos.get("realized_partial")) + (1.0 - partial) * pnl
+    sl0 = _f(pos.get("original_sl"), _f(pos.get("sl"), float("nan")))
+    entry = float(pos["entry_price"])
+    sl_dist_pct = abs(entry - sl0) / entry * 100 if np.isfinite(sl0) else 0.0
     r_multiple = (pnl / sl_dist_pct) if sl_dist_pct else None
     acct_risk = pos.get("account_risk_pct")
-    if r_multiple is not None and acct_risk:
-        account_pnl_percent = r_multiple * acct_risk
-    else:
-        account_pnl_percent = pnl
+    account_pnl_percent = (
+        r_multiple * acct_risk if (r_multiple is not None and acct_risk) else None
+    )
     return {
         "pnl": pnl,
         "r_multiple": r_multiple,
@@ -311,15 +396,17 @@ def close_trade(price, exit_reason, pnl_override=None, realized_partial=0.0):
         result = compute_trade_result(pos, price)
         pnl = result["pnl"]
         r_multiple = result["r_multiple"]
+        if not realized_partial and int(pos.get("stage") or 0) == 1:
+            realized_partial = _f(pos.get("realized_partial"))
 
     acct_risk = pos.get("account_risk_pct")
     account_pnl_percent = (
-        r_multiple * acct_risk if (r_multiple is not None and acct_risk) else pnl
+        r_multiple * acct_risk if (r_multiple is not None and acct_risk) else None
     )
 
     cleaned = {
         k: v for k, v in pos.items()
-        if k not in ("stage", "partial", "realized_partial")
+        if k not in ("stage", "partial", "realized_partial", "last_bar_ts")
     }
     st.session_state.trades.append({
         **cleaned, **meta,
@@ -329,7 +416,7 @@ def close_trade(price, exit_reason, pnl_override=None, realized_partial=0.0):
         "pnl_percent": pnl,
         "r_multiple": r_multiple,
         "account_pnl_percent": account_pnl_percent,
-        "partial_realized": realized_partial,
+        "partial_realized": _f(realized_partial),
     })
     st.session_state.current_position = None
     why = {
@@ -337,7 +424,7 @@ def close_trade(price, exit_reason, pnl_override=None, realized_partial=0.0):
         "TP": "تحقق الهدف",
         "BE": "أُغلق عند الدخول (بعد TP1)",
         "Manual": "أُغلقت يدوياً",
-    }[exit_reason]
+    }.get(exit_reason, str(exit_reason))
     kind = "success" if pnl > 0 else "error"
     st.session_state.notice = (
         kind,
@@ -352,10 +439,37 @@ def _bar_touches(direction, hi, lo, level, kind):
     return hi >= level if kind == "sl" else lo <= level
 
 
+def _to_utc_index(idx):
+    idx = pd.DatetimeIndex(idx)
+    return idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+
+
+def _since_ts(pos):
+    """أول لحظة يُعتدّ بعدها بالشموع: آخر شمعة تمت معالجتها، وإلا لحظة الدخول (UTC)."""
+    for key in ("last_bar_ts", "entry_ts_utc"):
+        v = pos.get(key)
+        if v:
+            try:
+                ts = pd.Timestamp(v)
+                return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+            except Exception:
+                pass
+    # سجلات قديمة: entry_time محلي (توقيت الجهاز)
+    try:
+        return pd.Timestamp(datetime.strptime(
+            pos["entry_time"], "%Y-%m-%d %H:%M").astimezone(timezone.utc))
+    except Exception:
+        return None
+
+
 def check_exit_candles(pos, df_bars):
-    events = []
+    """يفحص الشموع *المكتملة والجديدة فقط* منذ آخر فحص، ويطابق منطق run_backtest_v2.
+    يرجع (events, last_ts): last_ts آخر شمعة عولجت (UTC) لتُحفظ في الصفقة.
+    (النسخة السابقة كانت تعيد المسح من لحظة الدخول بمرحلة 'stage' مبدئية، فيُغلق
+    الوقف عند التعادل زورًا بسبب شمعة سبقت تحقق الهدف الأول.)"""
+    events, last_ts = [], None
     if df_bars is None or df_bars.empty or pos is None:
-        return events
+        return events, last_ts
 
     direction = pos["direction"]
     entry = float(pos["entry_price"])
@@ -364,33 +478,31 @@ def check_exit_candles(pos, df_bars):
     tp1 = float(pos.get("tp1") or tp)
     stage = int(pos.get("stage", 0))
 
-    try:
-        entry_ts = pd.Timestamp(pos["entry_time"])
-        idx_tz = df_bars.index.tz
-        if idx_tz is not None and entry_ts.tz is None:
-            entry_ts = entry_ts.tz_localize(idx_tz)
-        elif idx_tz is None and entry_ts.tz is not None:
-            entry_ts = entry_ts.tz_localize(None)
-    except Exception:
-        entry_ts = None
+    since = _since_ts(pos)
+    idx = _to_utc_index(df_bars.index)
+    bar_td = pd.Series(idx).diff().median()
+    if pd.isna(bar_td):
+        bar_td = pd.Timedelta(minutes=5)
+    now = pd.Timestamp.now(tz="UTC")
 
-    for ts, bar in df_bars.iterrows():
-        if entry_ts is not None and pd.Timestamp(ts) <= entry_ts:
+    hi_a = df_bars["High"].to_numpy(dtype=float)
+    lo_a = df_bars["Low"].to_numpy(dtype=float)
+    op_a = df_bars["Open"].to_numpy(dtype=float)
+
+    for k, ts in enumerate(idx):
+        if since is not None and ts <= since:
             continue
-        hi, lo, op = (
-            float(bar["High"]), float(bar["Low"]), float(bar["Open"])
-        )
+        if ts + bar_td > now:      # شمعة لم تكتمل بعد
+            break
+        last_ts = ts
+        hi, lo, op = hi_a[k], lo_a[k], op_a[k]
 
         cur_sl = sl if stage == 0 else entry
         if _bar_touches(direction, hi, lo, cur_sl, "sl"):
-            fill = (
-                min(cur_sl, op) if direction == "BUY" else max(cur_sl, op)
-            )
-            events.append({
-                "type": "sl" if stage == 0 else "be",
-                "price": fill, "time": ts,
-            })
-            return events
+            fill = min(cur_sl, op) if direction == "BUY" else max(cur_sl, op)
+            events.append({"type": "sl" if stage == 0 else "be",
+                           "price": fill, "time": ts})
+            return events, last_ts
 
         if stage == 0 and _bar_touches(direction, hi, lo, tp1, "tp"):
             events.append({"type": "tp1", "price": tp1, "time": ts})
@@ -398,25 +510,28 @@ def check_exit_candles(pos, df_bars):
 
         if stage == 1 and _bar_touches(direction, hi, lo, tp, "tp"):
             events.append({"type": "tp2", "price": tp, "time": ts})
-            return events
+            return events, last_ts
 
-    return events
+    return events, last_ts
 
 
-def fetch_bars_since(ticker, entry_time, max_days=90):
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_bars_since(ticker, entry_time):
+    """يجلب شموع منذ وقت الدخول. 5m/1h/1d حسب العمر."""
     try:
         entry_ts = pd.Timestamp(entry_time)
     except Exception:
         return None
     age_days = (pd.Timestamp.now() - entry_ts).days
     if age_days <= 5:
-        interval, period = "5m", "5d"
+        interval, kw = "5m", {"period": "5d"}
     elif age_days <= 30:
-        interval, period = "1h", "30d"
-    else:
-        interval, period = "1d", f"{min(max_days, 90)}d"
+        interval, kw = "1h", {"period": "30d"}
+    else:   # أقدم من 30 يومًا: يومي من تاريخ الدخول مهما كان العمر
+        interval = "1d"
+        kw = {"start": (entry_ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")}
     try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        df = yf.Ticker(ticker).history(interval=interval, **kw)
         if df.empty:
             return None
         cols = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
@@ -425,12 +540,14 @@ def fetch_bars_since(ticker, entry_time, max_days=90):
         return None
 
 
-def _apply_exit_events(events):
+def _apply_exit_events(events, last_ts=None):
     pos = st.session_state.current_position
     if pos is None:
         return
-    realized = float(pos.get("realized_partial", 0.0))
-    partial = float(pos.get("partial", 0.5))
+    realized = _f(pos.get("realized_partial"))
+    partial = _f(pos.get("partial"), 0.5)
+    if last_ts is not None:
+        pos["last_bar_ts"] = last_ts.isoformat()
 
     for ev in events:
         if ev["type"] == "tp1":
@@ -458,19 +575,22 @@ def _apply_exit_events(events):
                 realized_partial=realized,
             )
             return
+    persist(force=True)   # كان TP1 يُنقل في الذاكرة فقط ويضيع عند إعادة التحميل
 
 
 def check_exit(price):
+    """فحص الخروج بناءً على الشموع الجديدة منذ آخر فحص. fallback: نقطة السعر."""
     pos = st.session_state.current_position
     if pos is None:
         return
 
     df_bars = fetch_bars_since(pos["ticker"], pos["entry_time"])
     if df_bars is not None and not df_bars.empty:
-        events = check_exit_candles(pos, df_bars)
+        events, last_ts = check_exit_candles(pos, df_bars)
         if events:
-            _apply_exit_events(events)
-            return
+            _apply_exit_events(events, last_ts)
+        elif last_ts is not None:
+            pos["last_bar_ts"] = last_ts.isoformat()
         return
 
     if pos["direction"] == "BUY":
@@ -484,6 +604,7 @@ def check_exit(price):
 
 
 def should_alert_event(news, ticker, last_alerts, cooldown_hours=6.0):
+    """تنبيه حدث اقتصادي كبير."""
     if not isinstance(news, dict):
         return False
     if str(news.get("event_risk", "")).lower() != "high":
@@ -501,6 +622,7 @@ def should_alert_event(news, ticker, last_alerts, cooldown_hours=6.0):
 
 
 def should_alert_position(pos, price, last_alert_time=None, cooldown_hours=6.0):
+    """تنبيه قرب الوقف/الهدف."""
     atr = float(pos.get("atr") or 0)
     if atr <= 0:
         return False, ""
@@ -532,19 +654,15 @@ def should_alert_position(pos, price, last_alert_time=None, cooldown_hours=6.0):
 
 
 def compute_equity_curve(trades, initial=100.0):
+    """يبني منحنى رأس المال من سجل الصفقات."""
     if not trades:
         return pd.DataFrame()
     rows = []
     eq, peak = float(initial), float(initial)
     for tr in trades:
-        try:
-            pnl = float(
-                tr.get("account_pnl_percent")
-                if tr.get("account_pnl_percent") is not None
-                else tr.get("pnl_percent") or 0.0
-            )
-        except (TypeError, ValueError):
-            pnl = 0.0
+        pnl = account_pnl_of(tr)
+        if pnl is None:
+            continue
         eq *= (1 + pnl / 100.0)
         peak = max(peak, eq)
         rows.append({
@@ -557,16 +675,14 @@ def compute_equity_curve(trades, initial=100.0):
 
 
 def monte_carlo(trades, n_sims=1000, n_trades=None, initial=100.0, seed=42):
+    """محاكاة مونت كارلو: إعادة سحب عشوائي للصفقات."""
     if not trades:
         return None
     pnls = []
     for tr in trades:
-        try:
-            val = tr.get("account_pnl_percent")
-            val = val if val is not None else tr.get("pnl_percent")
-            pnls.append(float(val or 0.0))
-        except (TypeError, ValueError):
-            continue
+        val = account_pnl_of(tr)
+        if val is not None:
+            pnls.append(val)
     if not pnls:
         return None
     pnls = np.array(pnls, dtype=float)
