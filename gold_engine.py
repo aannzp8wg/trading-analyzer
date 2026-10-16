@@ -1,13 +1,12 @@
 """
 gold_engine.py — محرك الاستراتيجيات الذهبية + مستويات ذكية + Backtest
-مع TP1 ونقل الوقف + Gann HiLo Activator.
+مع TP1 ونقل الوقف.
 """
 import numpy as np
 import pandas as pd
 
-from constants import CONFLUENCE, GANN, RSI2, SQUEEZE, TURTLE, STRATEGY_FAMILIES
-
-NEW_STRATEGIES = [CONFLUENCE, SQUEEZE, TURTLE, RSI2, GANN]
+from constants import (BREAKOUT, CONFLUENCE, GANN, MEAN_REV, NEW_STRATEGIES,  # noqa: F401
+                       PULLBACK, RSI2, SQUEEZE, STRATEGY_FAMILIES, TREND, TURTLE)
 
 SL_MIN_ATR, SL_MAX_ATR, SL_BUFFER_ATR = 1.0, 2.5, 0.25
 TP1_R, TP2_R = 1.5, 3.0
@@ -22,6 +21,7 @@ def _safe_float(x):
         return np.nan
 
 
+# ------------------------------------------------ مؤشرات إضافية
 def add_extra_indicators(df):
     df = df.copy()
     c = df["Close"]
@@ -29,47 +29,56 @@ def add_extra_indicators(df):
     df["SMA20"] = c.rolling(20).mean()
     df["SMA200"] = c.rolling(200).mean()
 
+    # RSI(2)
     d = c.diff()
     g = d.clip(lower=0).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
     l = (-d.clip(upper=0)).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
     df["RSI2"] = 100 - 100 / (1 + g / l.replace(0, np.nan))
 
+    # Keltner + Squeeze
     kel_u = df["EMA20"] + 1.5 * df["ATR14"]
     kel_l = df["EMA20"] - 1.5 * df["ATR14"]
     df["SQUEEZE_ON"] = (df["BB_Upper"] < kel_u) & (df["BB_Lower"] > kel_l)
 
+    # Donchian 55 / 10
     df["Don55_Up"] = df["High"].rolling(55).max()
     df["Don55_Dn"] = df["Low"].rolling(55).min()
     df["Don10_Up"] = df["High"].rolling(10).max()
     df["Don10_Dn"] = df["Low"].rolling(10).min()
 
+    # MACD histogram
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     df["MACD_H"] = macd - macd.ewm(span=9, adjust=False).mean()
 
+    # قمم/قيعان قريبة
     df["Low5"] = df["Low"].rolling(5).min()
     df["High5"] = df["High"].rolling(5).max()
     return df
 
 
-def gann_hilo_signals(df, period=3):
-    """Gann HiLo Activator — يتغير الاتجاه عند اختراق متوسط القمم/القيعان."""
-    h, l, c = df["High"], df["Low"], df["Close"]
-    sma_h = h.rolling(period).mean()
-    sma_l = l.rolling(period).mean()
-    sig = pd.Series(0, index=df.index, dtype=int)
-    trend = 0
-    ch, sh, sl = c.values, sma_h.values, sma_l.values
-    for i in range(period, len(df)):
-        if trend <= 0 and ch[i] > sh[i]:
-            trend = 1
-            sig.iloc[i] = 1
-        elif trend >= 0 and ch[i] < sl[i]:
-            trend = -1
-            sig.iloc[i] = -1
-    return sig
+# ------------------------------------------------ الإشارات
+def gann_hilo_signals(df, period=10):
+    """Gann HiLo Activator: الاتجاه صاعد عندما يغلق السعر فوق متوسط القمم
+    (للفترة السابقة)، وهابط عندما يغلق تحت متوسط القيعان؛ وفيما بينهما يبقى
+    الاتجاه السابق. الإشارة عند *انقلاب* الاتجاه فقط (لا تكرار كل شمعة)."""
+    c = df["Close"]
+    hi_ma = df["High"].rolling(period).mean().shift(1)
+    lo_ma = df["Low"].rolling(period).mean().shift(1)
+    raw = pd.Series(np.nan, index=df.index)
+    raw[c > hi_ma] = 1.0
+    raw[c < lo_ma] = -1.0
+    state = raw.ffill()
+    prev = state.shift(1)
+    # prev=NaN في أول حالة معروفة: لا انقلاب حقيقي هناك، فلا إشارة
+    return pd.Series(
+        np.select([(state == 1) & (prev == -1), (state == -1) & (prev == 1)],
+                  [1, -1], default=0),
+        index=df.index,
+    )
 
 
 def extra_signals(df, base_sigs):
+    """base_sigs = خرج strategy_signals الأصلي. يرجع قاموسًا بالإشارات الجديدة."""
     c = df["Close"]
 
     def to_sig(buy, sell):
@@ -96,16 +105,13 @@ def extra_signals(df, base_sigs):
         (c < df["SMA200"]) & (df["RSI2"] > 90) & (c > df["SMA5"]),
     )
 
+    # Confluence: تصويت بحسب العائلة، لا بحسب الاستراتيجية الفردية
     all_signals = {}
-    for k in (
-        "Breakout (اختراق)",
-        "Trend + Pullback (اتجاه+ارتداد)",
-        "Mean Reversion (عودة للمتوسط)",
-        "Trend Follow (تتبع الاتجاه)",
-    ):
+    for k in (BREAKOUT, PULLBACK, MEAN_REV, TREND):
         if k in base_sigs:
             all_signals[k] = base_sigs[k]
-    all_signals.update({SQUEEZE: squeeze, TURTLE: turtle, RSI2: rsi2})
+    gann = gann_hilo_signals(df)
+    all_signals.update({SQUEEZE: squeeze, TURTLE: turtle, RSI2: rsi2, GANN: gann})
 
     fam_series = {}
     for name, sig in all_signals.items():
@@ -139,21 +145,20 @@ def extra_signals(df, base_sigs):
     else:
         conf = pd.Series(0, index=df.index)
 
-    return {SQUEEZE: squeeze, TURTLE: turtle, RSI2: rsi2, CONFLUENCE: conf,
-            GANN: gann_hilo_signals(df)}
+    return {SQUEEZE: squeeze, TURTLE: turtle, RSI2: rsi2, GANN: gann,
+            CONFLUENCE: conf}
+
+
+# ------------------------------------------------ مستويات ذكية
+def _invalid_levels():
+    return {"sl": np.nan, "tp1": np.nan, "tp2": np.nan, "risk_dist": np.nan,
+            "rr1": np.nan, "rr2": np.nan, "valid": False}
 
 
 def smart_levels(signal, entry, df, i=-1, mean_rev=False):
+    """Return deterministic SL/TP levels from completed-bar data only."""
     if signal not in ("BUY", "SELL"):
-        return {
-            "sl": np.nan,
-            "tp1": np.nan,
-            "tp2": np.nan,
-            "risk_dist": np.nan,
-            "rr1": np.nan,
-            "rr2": np.nan,
-            "valid": False,
-        }
+        return _invalid_levels()
     row = df.iloc[i]
     atr = _safe_float(row.get("ATR14"))
     entry = _safe_float(entry)
@@ -166,29 +171,13 @@ def smart_levels(signal, entry, df, i=-1, mean_rev=False):
         or not np.isfinite(low5)
         or not np.isfinite(high5)
     ):
-        return {
-            "sl": np.nan,
-            "tp1": np.nan,
-            "tp2": np.nan,
-            "risk_dist": np.nan,
-            "rr1": np.nan,
-            "rr2": np.nan,
-            "valid": False,
-        }
+        return _invalid_levels()
 
     s = 1 if signal == "BUY" else -1
     swing = low5 - SL_BUFFER_ATR * atr if s == 1 else high5 + SL_BUFFER_ATR * atr
     sd = min(max(abs(entry - swing), SL_MIN_ATR * atr), SL_MAX_ATR * atr)
     if not np.isfinite(sd) or sd <= 0:
-        return {
-            "sl": np.nan,
-            "tp1": np.nan,
-            "tp2": np.nan,
-            "risk_dist": np.nan,
-            "rr1": np.nan,
-            "rr2": np.nan,
-            "valid": False,
-        }
+        return _invalid_levels()
 
     sl = entry - s * sd
     tp1 = entry + s * TP1_R * sd
@@ -215,7 +204,11 @@ def smart_levels(signal, entry, df, i=-1, mean_rev=False):
     }
 
 
+# ------------------------------------------------ Backtest v2
 def run_backtest_v2(df, signals, cost_pct=0.05, max_hold=30, start=200, mean_rev=False, partial=0.5):
+    """
+    Backtest with next-bar entry, smart SL, TP1 partial close and BE.
+    """
     required = ["Open", "High", "Low", "Close", "ATR14", "Low5", "High5", "SMA20"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -308,7 +301,7 @@ def run_backtest_v2(df, signals, cost_pct=0.05, max_hold=30, start=200, mean_rev
         gross_pnl = realized_gross + remaining_gross
         net_pnl = gross_pnl - cost_pct
         risk_pct = sd / entry * 100.0
-        r_multiple = gross_pnl / risk_pct if risk_pct > 0 else np.nan
+        r_multiple = net_pnl / risk_pct if risk_pct > 0 else np.nan
         trades.append(
             {
                 "entry_date": df.index[i + 1],
