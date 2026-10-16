@@ -22,36 +22,39 @@ from agents import (
     _list_gemini, _list_groq,
 )
 from constants import (
-    ASSETS, AUTO, BREAKOUT, CONTRARIAN, CORRELATION_NOTES, DEFAULT_COST,
+    ALL_STRATEGIES, ASSETS, AUTO, BREAKOUT, CORRELATION_NOTES, GANN, DEFAULT_COST,
     MEAN_REV, PULLBACK, TF_D1, TF_DUAL, TF_H4, TREND,
 )
-from data_engine import (
-    apply_bias_filter, calculate_indicators, load_data, load_data_h4,
-    load_prepared,
-)
+from data_engine import calculate_indicators, load_data, load_data_h4, load_prepared
 from gold_engine import (
-    CONFLUENCE, GANN, RSI2, SQUEEZE, TURTLE, run_backtest_v2, smart_levels,
+    CONFLUENCE, RSI2, run_backtest_v2, smart_levels,
 )
 from journal import (
     calc_pnl, check_exit, close_trade, compute_equity_curve,
-    daily_breaker_status, fetch_bars_since, get_live_price, journal_groups,
+    daily_breaker_status, get_live_price, journal_groups,
     journal_load, journal_save, meta_from, monte_carlo, open_position,
     persist, should_alert_event, should_alert_position, storage_mode,
 )
 from risk_engine import (
     P, arbitrate, as_list, backtest_stats, build_plan, clean_price_levels,
     compute_quality, correlation_exposure_check, final_decision,
-    format_alert, guess_contract_size, history_evidence, trade_levels,
-    truthy, walk_forward_evidence,
+    format_alert, guess_contract_size, history_evidence, truthy,
 )
-from strategies import auto_signals, select_strategy, strategy_signals
+from strategies import select_strategy, strategy_matrix
 
-try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except KeyError as e:
-    st.error(f"خطأ: المفتاح {e} غير موجود في Streamlit Secrets.")
-    st.stop()
+def _has_secret(k):
+    try:
+        return bool(st.secrets.get(k))
+    except Exception:
+        return False
+
+
+_missing = [k for k in ("GEMINI_API_KEY", "GROQ_API_KEY") if not _has_secret(k)]
+if _missing:
+    st.warning(
+        f"المفاتيح الناقصة في Secrets: {', '.join(_missing)} — الوكلاء الناقصون "
+        "سيُعدّون «غير متاحين» والنظام لن يوصي بدخول (fail-closed)."
+    )
 
 st.title("محلل الذهب واليورو والدولار 🥇💶💵")
 st.markdown("### فريق وكلاء: فني + أخبار + مخاطر")
@@ -80,6 +83,7 @@ if "journal_loaded" not in st.session_state:
     st.session_state.journal_load_err = _jerr
     st.session_state.journal_loaded = True
 
+# flush أي حفظ مؤجل
 if st.session_state.get("journal_dirty") and st.session_state.get("journal_loaded"):
     _now = time.time()
     _last = st.session_state.get("journal_last_save_ts", 0.0)
@@ -124,6 +128,15 @@ def create_chart(df, ticker, signal=None, sl=None, tp1=None, tp2=None, tf_label=
     return fig
 
 
+def exec_levels(direction, px, a):
+    """مستويات التنفيذ الفعلي؛ None إذا كانت غير صالحة (كانت NaN تُحفظ في الصفقة)."""
+    if not a or a.get("df") is None:
+        return None
+    L = smart_levels(direction, px, a["df"],
+                     mean_rev=a.get("used") in (MEAN_REV, RSI2))
+    return L if L["valid"] else None
+
+
 TV_MAP = {
     "GC=F": "OANDA:XAUUSD", "SI=F": "OANDA:XAGUSD", "CL=F": "TVC:USOIL",
     "BZ=F": "TVC:UKOIL", "NG=F": "CAPITALCOM:NATURALGAS",
@@ -164,6 +177,8 @@ def tradingview_html(symbol, interval, height=520):
 
 
 def render_tv_chart(a=None):
+    if not show_tv:
+        return
     sym_default = guess_tv_symbol(ticker)
     with st.expander("📺 الشارت الحي (TradingView)", expanded=True):
         c1, c2 = st.columns([2, 1])
@@ -379,30 +394,34 @@ def run_diagnostics(t):
     return out
 
 
+# ---------------------------------------------------------------------
+# الشريط الجانبي
+# ---------------------------------------------------------------------
 with st.sidebar:
     st.header("الإعدادات")
     asset_label = st.selectbox("الأصل", list(ASSETS.keys()))
     ticker = ASSETS[asset_label]
     strategy = st.selectbox(
         "الاستراتيجية",
-        [AUTO, CONFLUENCE, TREND, BREAKOUT, SQUEEZE, TURTLE,
-         PULLBACK, RSI2, MEAN_REV, GANN],
+        ALL_STRATEGIES,
     )
     timeframe = st.selectbox("الإطار الزمني", [TF_DUAL, TF_D1, TF_H4])
     st.caption("المزدوج: لا شراء إلا إذا كان اليومي فوق EMA200. "
                "الاستراتيجيات الانعكاسية معفاة.")
     use_closed = st.checkbox("استخدم آخر شمعة مكتملة فقط", value=True)
+    show_tv = st.checkbox("📺 إظهار شارت TradingView (أثقل)", value=False)
     cost_pct = st.number_input(
         "تكلفة الصفقة % (سبريد + عمولة)",
         min_value=0.0, max_value=2.0,
         value=DEFAULT_COST.get(ticker.strip().upper(), 0.05),
         step=0.01, key=f"cost_{ticker.strip().upper()}",
-        help="تُستخدم في حساب الأدلة التاريخية والباكتست.",
+        help="تُخصم مرة واحدة عن الدورة كاملة (دخول + خروج) وتشمل السبريد والعمولة. "
+             "لا يشمل الانزلاق السعري. تُستخدم في الباكتست والأدلة التاريخية.",
     )
     balance = st.number_input("رأس المال (للحجم المقترح)",
                               min_value=100.0, value=10000.0, step=100.0)
     risk_pct = st.slider("المخاطرة لكل صفقة %", 0.25, 3.0, 1.0, 0.25)
-    alert_threshold = st.slider("حد التنبيه (نقاط الجودة)", 60, 95, 70, 5)
+    alert_threshold = st.slider("حد التنبيه (نقاط الجودة)", 60, 95, 85, 5)
     contract_size = st.number_input(
         "وحدات لكل 1 لوت", min_value=0.0001,
         value=guess_contract_size(ticker),
@@ -443,6 +462,9 @@ with st.sidebar:
             st.code(str(detail_)[:400])
 
 
+# ---------------------------------------------------------------------
+# تشغيل التحليل
+# ---------------------------------------------------------------------
 if analyze_btn:
     pos = st.session_state.current_position
     t = ticker.strip()
@@ -451,6 +473,9 @@ if analyze_btn:
     elif pos is not None and pos["ticker"] != t:
         st.warning(f"⚠️ لديك صفقة مفتوحة على {pos['ticker']}.")
     else:
+        if pos is not None and pos["ticker"] == t:
+            st.info(f"ℹ️ لديك صفقة مفتوحة على {t} — التحليل الجديد لن يغيّرها، "
+                    "ولن تُفتح صفقة ثانية حتى تُغلق الحالية.")
         with st.spinner(f"جاري تحليل {t}..."):
             try:
                 df, bias_s, err = load_prepared(t, timeframe, use_closed)
@@ -492,10 +517,9 @@ if analyze_btn:
 
                         evidence, score, parts = None, 0, []
                         if signal in ("BUY", "SELL"):
-                            # 🔴 معطّل مؤقتًا للسرعة على Streamlit Cloud
-                            # evidence = history_evidence(
-                            #     t, timeframe, df, bias_s, used,
-                            #     use_closed, cost=cost_pct)
+                            evidence = history_evidence(
+                                t, timeframe, df, bias_s, used,
+                                use_closed, cost=cost_pct)
                             score, parts = compute_quality(
                                 signal, df, adx, used, bias,
                                 agents["tech"], agents["news"],
@@ -511,6 +535,7 @@ if analyze_btn:
                             tg = send_telegram(format_alert(
                                 t, timeframe, used, plan_obj, score))
 
+                        # تنبيه حدث اقتصادي كبير (مرة كل 6 ساعات لكل رمز)
                         news = agents.get("news")
                         if news and should_alert_event(
                                 news, t, st.session_state.get("event_alerts")):
@@ -548,7 +573,15 @@ if analyze_btn:
                 st.code(traceback.format_exc()[-1800:])
 
 
+# ---------------------------------------------------------------------
+# عرض النتائج
+# ---------------------------------------------------------------------
 a = st.session_state.analysis
+_REQ_KEYS = {"plan", "checks", "df", "signal", "price", "atr", "ticker", "used",
+             "regime", "adx", "rsi", "ema200", "time", "parts", "threshold"}
+if a is not None and not _REQ_KEYS <= set(a):   # تحليل من نسخة قديمة
+    st.session_state.analysis = a = None
+    st.info("أُعيد ضبط تحليل قديم من نسخة سابقة — شغّل التحليل من جديد.")
 if a is None:
     render_tv_chart(None)
 if a is not None:
@@ -625,6 +658,44 @@ if a is not None:
         use_container_width=True,
     )
 
+    # لوحة Walk-Forward
+    ev = a.get("evidence")
+    if ev and ev.get("walk_forward"):
+        with st.expander(f"🚶 Walk-Forward — {ev.get('folds', 0)} نوافذ",
+                          expanded=True):
+            st.caption("في كل نافذة، اختار النظام استراتيجيته على بيانات تدريب "
+                       "فقط، ثم اختُبر على نافذة تالية لم يرَها.")
+            pf = pd.DataFrame(ev.get("per_fold", []))
+            if not pf.empty:
+                pf = pf.rename(columns={
+                    "fold": "نافذة", "pick": "الاستراتيجية المختارة",
+                    "train_r": "R تدريب", "train_n": "صفقات تدريب",
+                    "test_r": "R اختبار", "test_n": "صفقات اختبار",
+                    "test_total": "إجمالي اختبار %",
+                })
+                st.dataframe(pf, use_container_width=True, hide_index=True)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("إجمالي صفقات OOS", ev.get("trades", 0))
+            m2.metric("متوسط R (OOS)", f"{ev.get('avg_r', 0):.2f}")
+            m3.metric("PF (OOS)",
+                      f"{ev.get('pf', 0):.2f}"
+                      if np.isfinite(ev.get('pf', 0)) else "∞")
+            m4.metric("إجمالي % (OOS)", f"{ev.get('total', 0):+.1f}%")
+
+            if ev.get("picks"):
+                uniq = len(set(ev["picks"]))
+                if uniq > 1:
+                    st.success(
+                        f"✅ النظام اختار {uniq} استراتيجية مختلفة عبر "
+                        f"{len(ev['picks'])} نوافذ — دليل على التكيّف."
+                    )
+                else:
+                    st.info(
+                        f"النظام اختار نفس الاستراتيجية "
+                        f"({ev['picks'][0].split(' (')[0]}) في كل النوافذ."
+                    )
+
     st.markdown("## 🧠 فريق الوكلاء")
     ag = a.get("agents")
     if not ag:
@@ -664,6 +735,8 @@ if a is not None:
         with st.expander("📰 وكيل الأخبار", expanded=True):
             if ag.get("news_model"):
                 st.caption(f"النموذج: {ag['news_model']}")
+            if news is not None and ag.get("news_err"):
+                st.caption(f"⚠️ {ag['news_err']}")
             if news is None:
                 st.error(f"غير متاح: {ag['news_err']}")
                 if ag["news_raw"]:
@@ -684,8 +757,8 @@ if a is not None:
                           imp.get(str(news.get("impact_on_signal", "")).lower(), "—"))
                 if news.get("summary"):
                     st.markdown(str(news["summary"]))
-                for ev in as_list(news.get("key_events")):
-                    st.markdown(f"- {ev}")
+                for ev_ in as_list(news.get("key_events")):
+                    st.markdown(f"- {ev_}")
                 if ag["news_sources"]:
                     st.markdown("**المصادر:**")
                     for src_ in ag["news_sources"]:
@@ -731,6 +804,9 @@ if a is not None:
                            "للدولار، لا كصفقة منفصلة.")
 
 
+# ---------------------------------------------------------------------
+# محاكي التداول
+# ---------------------------------------------------------------------
 pos = st.session_state.current_position
 if st.session_state.notice:
     kind, msg = st.session_state.notice
@@ -795,47 +871,50 @@ if a is not None or pos is not None:
         elif not exec_is_live:
             st.warning("تعذّر جلب سعر لحظي للتنفيذ؛ لم تُفتح الصفقة.")
         else:
-            mean_rev_exec = a.get("used") in (MEAN_REV, RSI2)
-            exec_sl, exec_tp1, exec_tp2 = trade_levels(
-                plan_dir, execution_price, atr, a.get("df"), mean_rev_exec)
-            exec_risk_pct = risk_pct * (a.get("arb") or {}).get("mult", 1.0)
-            open_position(
-                plan_dir, execution_price, sim_ticker, atr,
-                meta_from(a, "plan"),
-                exec_sl, exec_tp2, tp1=exec_tp1,
-                account_risk_pct=exec_risk_pct,
-            )
-            st.rerun()
+            L = exec_levels(plan_dir, execution_price, a)
+            if L is None:
+                st.warning("مستويات الوقف/الهدف غير صالحة عند السعر الحالي؛ لم تُفتح الصفقة.")
+            else:
+                exec_risk_pct = risk_pct * (a.get("arb") or {}).get("mult", 1.0)
+                open_position(
+                    plan_dir, execution_price, sim_ticker, atr,
+                    meta_from(a, "plan"),
+                    L["sl"], L["tp2"], tp1=L["tp1"],
+                    account_risk_pct=exec_risk_pct,
+                )
+                st.rerun()
 
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("🟢 شراء يدوي", use_container_width=True,
                      disabled=(pos is not None or a is None or breaker_tripped)):
             manual_price, _ = get_live_price(sim_ticker, price)
-            mean_rev_manual = a.get("used") in (MEAN_REV, RSI2)
-            manual_sl, manual_tp1, manual_tp2 = trade_levels(
-                "BUY", manual_price, atr, a.get("df"), mean_rev_manual)
-            open_position(
-                "BUY", manual_price, sim_ticker, atr,
-                meta_from(a, "manual"),
-                manual_sl, manual_tp2, tp1=manual_tp1,
-                account_risk_pct=risk_pct,
-            )
-            st.rerun()
+            L = exec_levels("BUY", manual_price, a)
+            if L is None:
+                st.warning("مستويات الوقف/الهدف غير صالحة؛ لم تُفتح الصفقة.")
+            else:
+                open_position(
+                    "BUY", manual_price, sim_ticker, atr,
+                    meta_from(a, "manual"),
+                    L["sl"], L["tp2"], tp1=L["tp1"],
+                    account_risk_pct=risk_pct,
+                )
+                st.rerun()
     with col2:
         if st.button("🔴 بيع يدوي", use_container_width=True,
                      disabled=(pos is not None or a is None or breaker_tripped)):
             manual_price, _ = get_live_price(sim_ticker, price)
-            mean_rev_manual = a.get("used") in (MEAN_REV, RSI2)
-            manual_sl, manual_tp1, manual_tp2 = trade_levels(
-                "SELL", manual_price, atr, a.get("df"), mean_rev_manual)
-            open_position(
-                "SELL", manual_price, sim_ticker, atr,
-                meta_from(a, "manual"),
-                manual_sl, manual_tp2, tp1=manual_tp1,
-                account_risk_pct=risk_pct,
-            )
-            st.rerun()
+            L = exec_levels("SELL", manual_price, a)
+            if L is None:
+                st.warning("مستويات الوقف/الهدف غير صالحة؛ لم تُفتح الصفقة.")
+            else:
+                open_position(
+                    "SELL", manual_price, sim_ticker, atr,
+                    meta_from(a, "manual"),
+                    L["sl"], L["tp2"], tp1=L["tp1"],
+                    account_risk_pct=risk_pct,
+                )
+                st.rerun()
     with col3:
         if st.button("⏹️ إغلاق الصفقة", use_container_width=True,
                      disabled=pos is None):
@@ -860,6 +939,7 @@ if a is not None or pos is not None:
             st.info(f"✅ تحقق الهدف الأول — أُغلق {pct}% ونُقل الوقف إلى الدخول. "
                     f"محقق جزئيًا: {rp:+.2f}%")
 
+        # تنبيه صفقة قديمة
         try:
             opened = datetime.strptime(pos["entry_time"], "%Y-%m-%d %H:%M")
             age_h = (datetime.now() - opened).total_seconds() / 3600.0
@@ -871,6 +951,7 @@ if a is not None or pos is not None:
         except Exception:
             pass
 
+        # تنبيه قرب SL/TP
         if st.session_state.get("live_price_is_live"):
             should, why = should_alert_position(
                 pos, price, st.session_state.get("position_alert_last"))
@@ -894,6 +975,9 @@ if a is not None or pos is not None:
                     st.caption(f"تعذّر إرسال التنبيه: {res}")
 
 
+# ---------------------------------------------------------------------
+# السجل الدائم + إحصاءات التعلم
+# ---------------------------------------------------------------------
 st.markdown("---")
 st.header("📒 سجل الصفقات الدائم")
 if storage_mode() == "gist":
@@ -963,6 +1047,9 @@ else:
             st.rerun()
 
 
+# ---------------------------------------------------------------------
+# لوحة الأداء
+# ---------------------------------------------------------------------
 if st.session_state.trades and len(st.session_state.trades) >= 5:
     st.markdown("---")
     st.header("📈 لوحة الأداء (من سجلك الفعلي)")
@@ -1035,6 +1122,9 @@ if st.session_state.trades and len(st.session_state.trades) >= 5:
                        f"{mc['n_sims']} محاكاة.")
 
 
+# ---------------------------------------------------------------------
+# Backtest
+# ---------------------------------------------------------------------
 st.markdown("---")
 st.header("📊 اختبار الاستراتيجيات (Backtest)")
 st.caption("يقارن الاستراتيجيات والأطر الزمنية. لا يشمل رأي الذكاء الاصطناعي.")
@@ -1075,18 +1165,8 @@ if st.button("▶️ شغّل الاختبار", use_container_width=True):
                     if tf in (TF_H4, TF_DUAL) and bt_period in ("5y", "10y"):
                         notes.append(
                             f"{short(tf)}: Yahoo لا يوفر 1H لسنوات 5/10 بشكل موثوق.")
-                    sigs = strategy_signals(dfb)
-                    raw_sigs = {k: v.copy() for k, v in sigs.items()}
-                    sigs[AUTO] = auto_signals(dfb, raw_sigs, bias_b)
-                    if bias_b is not None:
-                        trend_part = {k: v for k, v in raw_sigs.items()
-                                      if k not in CONTRARIAN}
-                        contra_part = {k: v for k, v in raw_sigs.items()
-                                       if k in CONTRARIAN}
-                        trend_part = apply_bias_filter(trend_part, bias_b)
-                        sigs.update({**trend_part, **contra_part})
-                    for name in [AUTO, CONFLUENCE, TREND, BREAKOUT, SQUEEZE,
-                                  TURTLE, PULLBACK, RSI2, MEAN_REV, GANN]:
+                    sigs = strategy_matrix(dfb, bias_b)
+                    for name in ALL_STRATEGIES:
                         tr = run_backtest_v2(
                             dfb, sigs[name], bt_cost, int(bt_hold),
                             mean_rev=(name in (MEAN_REV, RSI2)))
@@ -1186,6 +1266,9 @@ if bt and "results" in bt and isinstance(bt.get("buy_hold"), dict):
                 st.caption("▲ شراء ▼ بيع ✕ خروج. الأخضر رابحة، الأحمر خاسرة.")
 
 
+# ---------------------------------------------------------------------
+# مقارنة متعددة الأصول
+# ---------------------------------------------------------------------
 st.markdown("---")
 st.header("🌍 مقارنة متعددة الأصول")
 st.caption("يشغّل نفس الاستراتيجية والإطار على كل الأصول المدعومة.")
@@ -1198,7 +1281,7 @@ multi_cost = mc3.number_input("تكلفة الصفقة %", 0.0, 2.0,
                                float(cost_pct), 0.01, key="multi_cost")
 multi_strategy = mc4.selectbox(
     "الاستراتيجية",
-    [AUTO, CONFLUENCE, TREND, BREAKOUT, SQUEEZE, TURTLE, PULLBACK, RSI2, MEAN_REV, GANN],
+    ALL_STRATEGIES,
     key="multi_strategy",
 )
 
@@ -1219,16 +1302,7 @@ if st.button("🌍 شغّل المقارنة", use_container_width=True, key="ru
                         multi_rows.append({"الأصل": label, "الرمز": tk_clean,
                                             "الحالة": "بيانات غير كافية"})
                         continue
-                    sigs = strategy_signals(dfb)
-                    raw = {k: v.copy() for k, v in sigs.items()}
-                    sigs[AUTO] = auto_signals(dfb, raw, bias_b)
-                    if bias_b is not None:
-                        tp_ = {k: v for k, v in raw.items()
-                               if k not in CONTRARIAN}
-                        cp_ = {k: v for k, v in raw.items()
-                               if k in CONTRARIAN}
-                        tp_ = apply_bias_filter(tp_, bias_b)
-                        sigs.update({**tp_, **cp_})
+                    sigs = strategy_matrix(dfb, bias_b)
                     sig_pick = sigs.get(multi_strategy)
                     if sig_pick is None:
                         multi_rows.append({"الأصل": label, "الرمز": tk_clean,
